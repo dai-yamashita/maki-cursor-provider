@@ -1,0 +1,21 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  proxy:
+    name: Cursor proxy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: proxy/package-lock.json
+      - run: npm ci --omit=dev
+        working-directory: proxy
+      - run: node --experimental-strip-types --disable-warning=ExperimentalWarning --test --test-concurrency=1 test/*.test.ts
+        working-directory: proxy
