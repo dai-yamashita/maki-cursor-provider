@@ -15,6 +15,9 @@ local STATE_NAME = "maki-cursor-provider"
 local install_root = nil
 local bound_port = nil
 local bound_token = nil
+local want_proxy = false
+local proxy_generation = 0
+local RESTART_DELAY_MS = 500
 
 local function base_url()
   return "http://127.0.0.1:" .. (bound_port or PLACEHOLDER_PORT) .. "/v1"
@@ -116,12 +119,38 @@ local function server_up()
 end
 
 local function stop_proxy()
+  want_proxy = false
+  proxy_generation = proxy_generation + 1
   local id = maki.fn.jobfind(PROXY_JOB)
   if id then
     maki.fn.jobstop(id)
   end
   bound_port = nil
   bound_token = nil
+end
+
+local function start_serve_job(extra)
+  local job_gen = proxy_generation
+  return maki.fn.jobstart(argv("serve"), {
+    cwd = proxy_root(),
+    scope = "plugin",
+    name = PROXY_JOB,
+    env = proxy_env(extra),
+    on_exit = function()
+      maki.defer_fn(function()
+        if not want_proxy then
+          return
+        end
+        if job_gen ~= proxy_generation then
+          return
+        end
+        if not bound_port or not bound_token then
+          return
+        end
+        start_serve_job(nil)
+      end, RESTART_DELAY_MS)
+    end,
+  })
 end
 
 local function ensure_running()
@@ -134,14 +163,9 @@ local function ensure_running()
     return nil, nonce_err or failed(nonce, "could not start the cursor proxy")
   end
   local ready = state_dir() .. "/ready-" .. trimmed(nonce.stdout) .. ".json"
-  local _, start_err = maki.fn.jobstart(argv("serve"), {
-    cwd = proxy_root(),
-    scope = "plugin",
-    name = PROXY_JOB,
-    env = proxy_env({
-      MAKI_CURSOR_PORT = "0",
-      MAKI_CURSOR_READY = ready,
-    }),
+  local _, start_err = start_serve_job({
+    MAKI_CURSOR_PORT = "0",
+    MAKI_CURSOR_READY = ready,
   })
   if start_err then
     return nil, start_err
@@ -158,6 +182,7 @@ local function ensure_running()
   end
   bound_port = tonumber(port_text)
   bound_token = token
+  want_proxy = true
   return true
 end
 

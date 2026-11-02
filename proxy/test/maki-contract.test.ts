@@ -5,7 +5,12 @@ import { join } from "node:path";
 import { chdir } from "node:process";
 import test from "node:test";
 import { makiToolArgs } from "../src/maki-args.ts";
-import { deriveBridgeKey, deriveConversationKey } from "../src/session-key.ts";
+import {
+  deriveBridgeKey,
+  deriveConversationKey,
+  pauseBridgeKey,
+  pauseConversationKey,
+} from "../src/session-key.ts";
 import { startFixture } from "../src/fixture.ts";
 
 const tools = new Set(["read", "write", "bash", "grep", "glob", "webfetch"]);
@@ -74,12 +79,25 @@ test("resume keeps the bridge key and a different session does not", () => {
     },
     { role: "tool", tool_call_id: "call_1", content: "fn main() {}" },
   ];
+  const third = [
+    ...resumed,
+    {
+      role: "assistant",
+      tool_calls: [{ id: "call_2", function: { name: "grep" } }],
+    },
+    { role: "tool", tool_call_id: "call_2", content: "match" },
+  ];
   const other = [
     { role: "system", content: "rules" },
     { role: "user", content: "read the tests" },
   ];
   assert.equal(deriveBridgeKey("composer-2.5", resumed, "sess-a"), deriveBridgeKey("composer-2.5", first, "sess-a"));
   assert.equal(deriveConversationKey(resumed, "sess-a"), deriveConversationKey(first, "sess-a"));
+  assert.equal(pauseBridgeKey("composer-2.5", first, "sess-a"), deriveBridgeKey("composer-2.5", resumed, "sess-a"));
+  assert.equal(pauseConversationKey(first, "sess-a"), deriveConversationKey(resumed, "sess-a"));
+  assert.equal(pauseBridgeKey("composer-2.5", resumed, "sess-a"), deriveBridgeKey("composer-2.5", third, "sess-a"));
+  assert.equal(pauseConversationKey(resumed, "sess-a"), deriveConversationKey(third, "sess-a"));
+  assert.notEqual(deriveBridgeKey("composer-2.5", resumed, "sess-a"), deriveBridgeKey("composer-2.5", third, "sess-a"));
   assert.notEqual(deriveBridgeKey("composer-2.5", first, "sess-a"), deriveBridgeKey("composer-2.5", other, "sess-a"));
   assert.notEqual(deriveBridgeKey("composer-2.5", first, "sess-a"), deriveBridgeKey("composer-2.5", first, "sess-b"));
   assert.notEqual(deriveBridgeKey("composer-2.5", first, "sess-a"), deriveBridgeKey("auto", first, "sess-a"));

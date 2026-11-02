@@ -37,8 +37,8 @@ export function keyMessages(messages: readonly KeyMessage[]): KeyMessage[] {
   return messages.slice(0, end);
 }
 
-function transcript(messages: readonly KeyMessage[]): string {
-  return keyMessages(messages)
+function messageTranscript(messages: readonly KeyMessage[]): string {
+  return messages
     .map((message) => {
       const calls = (message.tool_calls ?? [])
         .map((call) => `${call.id ?? ""}:${call.function?.name ?? ""}`)
@@ -46,6 +46,10 @@ function transcript(messages: readonly KeyMessage[]): string {
       return `${message.role}\n${message.tool_call_id ?? ""}\n${calls}\n${textOf(message.content)}`;
     })
     .join("\n---\n");
+}
+
+function transcript(messages: readonly KeyMessage[]): string {
+  return messageTranscript(keyMessages(messages));
 }
 
 function digest(label: string, body: string): string {
@@ -62,4 +66,16 @@ export function deriveBridgeKey(
   sessionId = "",
 ): string {
   return digest("bridge", `${sessionId}\n${modelId}\n${transcript(messages)}`);
+}
+
+export function pauseConversationKey(messages: readonly KeyMessage[], sessionId = ""): string {
+  return digest("conv", `${sessionId}\n${messageTranscript(messages)}`);
+}
+
+export function pauseBridgeKey(
+  modelId: string,
+  messages: readonly KeyMessage[],
+  sessionId = "",
+): string {
+  return digest("bridge", `${sessionId}\n${modelId}\n${messageTranscript(messages)}`);
 }

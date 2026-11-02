@@ -79,7 +79,12 @@ import { createHash } from "node:crypto";
 import { chmod, mkdir, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
 import { resolve as pathResolve } from "node:path";
 import { z } from "zod";
-import { deriveBridgeKey, deriveConversationKey } from "./session-key.ts";
+import {
+  deriveBridgeKey,
+  deriveConversationKey,
+  pauseBridgeKey,
+  pauseConversationKey,
+} from "./session-key.ts";
 import { classifyExec, streamCloseMessage, unavailableExec } from "./exec-reply.ts";
 
 const CURSOR_API_URL = process.env.CURSOR_API_URL ?? "https://api2.cursor.sh";
@@ -475,6 +480,13 @@ export function getProxyPort(): number | undefined {
   return proxyPort;
 }
 
+export function replaceProxyModels(models: ReadonlyArray<{ id: string; name: string }>): void {
+  proxyModels = models.map((model) => ({
+    id: model.id,
+    name: model.name,
+  }));
+}
+
 /** Drop fields maki's OpenAI codec may add that Cursor's agent request does not understand. */
 export function asCompletionRequest(value: unknown): ChatCompletionRequest {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -669,18 +681,44 @@ async function handleChatCompletion(
     );
   }
 
-  // bridgeKey: model-specific, for active tool-call bridges
-  // convKey: model-independent, for conversation state that survives model switches
-  const bridgeKey = deriveBridgeKey(modelId, body.messages, sessionId);
-  const convKey = deriveConversationKey(body.messages, sessionId);
-  const activeBridge = activeBridges.get(bridgeKey);
+  const lookupBridgeKey = deriveBridgeKey(modelId, body.messages, sessionId);
+  const lookupConvKey = deriveConversationKey(body.messages, sessionId);
+  const storeBridgeKey = pauseBridgeKey(modelId, body.messages, sessionId);
+  const storeConvKey = pauseConversationKey(body.messages, sessionId);
+
+  let stored = conversationStates.get(lookupConvKey);
+  if (!stored) {
+    // Fall back to the disk cache so conversations survive proxy restarts
+    // and in-memory TTL eviction (issues #22/#29).
+    stored = (await loadPersistedConversation(lookupConvKey)) ?? {
+      conversationId: deterministicUuid(`cursor-conv-id:${lookupConvKey}`),
+      checkpoint: null,
+      blobStore: new Map(),
+      lastAccessMs: Date.now(),
+    };
+  }
+  conversationStates.set(storeConvKey, stored);
+  if (storeConvKey !== lookupConvKey) {
+    conversationStates.delete(lookupConvKey);
+  }
+  stored.lastAccessMs = Date.now();
+  evictStaleConversations();
+
+  const activeBridge = activeBridges.get(lookupBridgeKey);
 
   if (activeBridge && toolResults.length > 0) {
-    activeBridges.delete(bridgeKey);
+    activeBridges.delete(lookupBridgeKey);
 
     if (activeBridge.bridge.alive) {
       // Resume the live bridge with tool results
-      return handleToolResultResume(activeBridge, toolResults, userText, modelId, bridgeKey, convKey);
+      return handleToolResultResume(
+        activeBridge,
+        toolResults,
+        userText,
+        modelId,
+        storeBridgeKey,
+        storeConvKey,
+      );
     }
 
     // Bridge died (timeout, server disconnect, etc.).
@@ -690,26 +728,11 @@ async function handleChatCompletion(
   }
 
   // Clean up stale bridge if present
-  if (activeBridge && activeBridges.has(bridgeKey)) {
+  if (activeBridge && activeBridges.has(lookupBridgeKey)) {
     clearInterval(activeBridge.heartbeatTimer);
     activeBridge.bridge.end();
-    activeBridges.delete(bridgeKey);
+    activeBridges.delete(lookupBridgeKey);
   }
-
-  let stored = conversationStates.get(convKey);
-  if (!stored) {
-    // Fall back to the disk cache so conversations survive proxy restarts
-    // and in-memory TTL eviction (issues #22/#29).
-    stored = (await loadPersistedConversation(convKey)) ?? {
-      conversationId: deterministicUuid(`cursor-conv-id:${convKey}`),
-      checkpoint: null,
-      blobStore: new Map(),
-      lastAccessMs: Date.now(),
-    };
-    conversationStates.set(convKey, stored);
-  }
-  stored.lastAccessMs = Date.now();
-  evictStaleConversations();
 
   // Build the request. When the bridge died mid tool-call, history already
   // contains the tool results and the request goes out as a resumeAction.
@@ -721,9 +744,15 @@ async function handleChatCompletion(
   payload.mcpTools = mcpTools;
 
   if (body.stream === false) {
-    return handleNonStreamingResponse(payload, accessToken, modelId, convKey);
+    return handleNonStreamingResponse(payload, accessToken, modelId, storeConvKey);
   }
-  return handleStreamingResponse(payload, accessToken, modelId, bridgeKey, convKey);
+  return handleStreamingResponse(
+    payload,
+    accessToken,
+    modelId,
+    storeBridgeKey,
+    storeConvKey,
+  );
 }
 
 interface ToolResultInfo {

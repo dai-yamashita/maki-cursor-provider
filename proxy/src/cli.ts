@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { access, chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { access, appendFile, chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import {
   generateCursorAuthParams,
@@ -69,12 +69,35 @@ async function ensure(): Promise<void> {
 }
 
 async function serve(): Promise<void> {
+  const logPath = resolve(dirname(credentialsPath), "proxy.log");
+  const failFromServe = (label: string, err: unknown): void => {
+    let line = `${label}: `;
+    if (err instanceof Error) {
+      line += err.message;
+      if (err.stack) line += `\n${err.stack}`;
+    } else {
+      line += String(err);
+    }
+    line += "\n";
+    void appendFile(logPath, line).finally(() => {
+      process.exit(1);
+    });
+  };
+  process.on("uncaughtException", (err) => {
+    failFromServe("uncaughtException", err);
+  });
+  process.on("unhandledRejection", (reason) => {
+    failFromServe("unhandledRejection", reason);
+  });
+
   await ensure();
-  const { startProxy } = await import("./proxy.ts");
+  const { startProxy, replaceProxyModels } = await import("./proxy.ts");
   const { getCursorModels } = await import("./models.ts");
-  const current = await readCredentials();
-  const models = await getCursorModels(current?.access ?? "");
-  const token = randomBytes(32).toString("base64url");
+  const envToken = process.env.MAKI_CURSOR_TOKEN;
+  const token =
+    typeof envToken === "string" && envToken.length > 0
+      ? envToken
+      : randomBytes(32).toString("base64url");
   const bound = await startProxy(
     async () => {
       const creds = await readCredentials();
@@ -86,7 +109,7 @@ async function serve(): Promise<void> {
       }
       return creds.access;
     },
-    models,
+    [],
     listenPort(),
     token,
   );
@@ -95,6 +118,9 @@ async function serve(): Promise<void> {
     await writeFile(ready, JSON.stringify({ port: bound, token }), { mode: 0o600 });
     await chmod(ready, 0o600);
   }
+  const current = await readCredentials();
+  const models = await getCursorModels(current?.access ?? "");
+  replaceProxyModels(models.map((model) => ({ id: model.id, name: model.name })));
   await new Promise(() => {});
 }
 
