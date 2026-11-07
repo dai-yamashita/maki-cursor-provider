@@ -274,10 +274,18 @@ function M.setup(root)
       }
     end,
 
-    list_models = function(ctx)
-      local parsed, err = ctx.get_json("/models")
-      if err then
-        return nil, err
+    -- The catalogue is on this process's own proxy. A third-party plugin's
+    -- ctx.get_json to 127.0.0.1 is refused unless the user allowlists it, so
+    -- read the list through the node CLI, the same path health checks use.
+    -- The CLI waits until discovery has replaced the empty startup list.
+    list_models = function(_)
+      local result, err = run("models", nil, 15000)
+      if not result or result.exit_code ~= 0 then
+        return nil, err or failed(result, "could not list cursor models")
+      end
+      local parsed, decode_err = maki.json.decode(trimmed(result.stdout))
+      if not parsed then
+        return nil, decode_err or "cursor model list was not json"
       end
       local rows = {}
       for _, model in ipairs(parsed.data or {}) do
@@ -288,6 +296,9 @@ function M.setup(root)
             max_output_tokens = 64000,
           }
         end
+      end
+      if #rows == 0 then
+        return nil, "cursor model list was empty"
       end
       return rows
     end,

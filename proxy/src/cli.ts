@@ -187,6 +187,50 @@ async function health(): Promise<void> {
   if (!response.ok) process.exit(1);
 }
 
+const MODEL_LIST_WAIT_MS = 12_000;
+
+async function models(): Promise<void> {
+  const listen = process.env.MAKI_CURSOR_PORT;
+  const token = process.env.MAKI_CURSOR_TOKEN;
+  if (!listen || !token) process.exit(1);
+  const deadline = Date.now() + MODEL_LIST_WAIT_MS;
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch(`http://127.0.0.1:${listen}/v1/models`, {
+        headers: { authorization: `Bearer ${token}` },
+      });
+      if (response.ok) {
+        const ids = modelIds(await response.json());
+        if (ids.length > 0) {
+          console.log(JSON.stringify({
+            object: "list",
+            data: ids.map((id) => ({ id })),
+          }));
+          return;
+        }
+      }
+    } catch {
+      // The proxy is still starting, or discovery has not filled the list.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  process.exit(1);
+}
+
+function modelIds(body: unknown): string[] {
+  if (!body || typeof body !== "object" || !("data" in body)) return [];
+  const data = body.data;
+  if (!Array.isArray(data)) return [];
+  const ids: string[] = [];
+  for (const item of data) {
+    if (!item || typeof item !== "object" || !("id" in item)) continue;
+    const id = item.id;
+    if (typeof id !== "string" || id === "") continue;
+    ids.push(id);
+  }
+  return ids;
+}
+
 async function nonce(): Promise<void> {
   console.log(randomBytes(16).toString("hex"));
 }
@@ -233,6 +277,7 @@ try {
   else if (command === "deps") await deps();
   else if (command === "logout") await logout();
   else if (command === "health") await health();
+  else if (command === "models") await models();
   else if (command === "nonce") await nonce();
   else if (command === "wait-ready") await waitReady();
   else if (command === "fixture") await fixture();
