@@ -75,9 +75,12 @@ local function argv(command, extra)
 end
 
 local function run(command, extra, timeout_ms)
+  -- Provider hooks run outside an agent task. The default job scope is that
+  -- task, so a catalogue refresh would fail before node starts.
   local id, err = maki.fn.jobstart(argv(command, extra), {
     cwd = proxy_root(),
     env = proxy_env(),
+    scope = "plugin",
   })
   if not id then
     return nil, err
@@ -97,6 +100,15 @@ local function failed(result, fallback)
     return result.stderr
   end
   return fallback
+end
+
+-- A plain `return nil, "string"` is decoded as a successful nil. Maki then
+-- reports "invalid type: nil, expected table" and keeps the static catalogue.
+local function provider_fail(message)
+  return nil, maki.provider.http_error({
+    status = 503,
+    body = message or "cursor provider failed",
+  })
 end
 
 local function ensure_deps()
@@ -157,16 +169,23 @@ local function ensure_running()
   if server_up() then
     return true
   end
+  -- A reload builds a new Lua state but keeps the base URL already handed to
+  -- maki. Bind that port again so chat and the catalogue stay on one proxy.
+  local keep_port, keep_token = bound_port, bound_token
   stop_proxy()
   local nonce, nonce_err = run("nonce", nil, 5000)
   if not nonce or nonce.exit_code ~= 0 then
     return nil, nonce_err or failed(nonce, "could not start the cursor proxy")
   end
   local ready = state_dir() .. "/ready-" .. trimmed(nonce.stdout) .. ".json"
-  local _, start_err = start_serve_job({
-    MAKI_CURSOR_PORT = "0",
-    MAKI_CURSOR_READY = ready,
-  })
+  local launch = { MAKI_CURSOR_READY = ready }
+  if keep_port and keep_token then
+    launch.MAKI_CURSOR_PORT = tostring(keep_port)
+    launch.MAKI_CURSOR_TOKEN = keep_token
+  else
+    launch.MAKI_CURSOR_PORT = "0"
+  end
+  local _, start_err = start_serve_job(launch)
   if start_err then
     return nil, start_err
   end
@@ -248,25 +267,27 @@ function M.setup(root)
     auth = function(_, purpose)
       local logged = run("status", nil, 5000)
       if not logged or logged.exit_code ~= 0 then
-        return nil, "run `maki auth login cursor`"
+        return provider_fail("run `maki auth login cursor`")
       end
-      local deps = run("deps", nil, 5000)
-      if not deps or deps.exit_code ~= 0 then
-        return nil, "run `maki auth login cursor`"
+      -- `deps` only checks. A pack update checks out a tree with no
+      -- node_modules, so install on the way to the proxy.
+      local ready, dep_err = ensure_deps()
+      if not ready then
+        return provider_fail(dep_err or "could not install cursor proxy dependencies")
       end
       if purpose == "refresh" then
         local refreshed, refresh_err = run("refresh", nil, 30000)
         if not refreshed or refreshed.exit_code ~= 0 then
-          return nil, refresh_err or failed(refreshed, "cursor token refresh failed")
+          return provider_fail(refresh_err or failed(refreshed, "cursor token refresh failed"))
         end
         local stored, store_err = store_login(trimmed(refreshed.stdout))
         if not stored then
-          return nil, store_err
+          return provider_fail(store_err or "could not store the cursor login")
         end
       end
       local running, run_err = ensure_running()
       if not running then
-        return nil, run_err
+        return provider_fail(run_err or "could not start the cursor proxy")
       end
       return {
         base_url = base_url(),
@@ -277,15 +298,36 @@ function M.setup(root)
     -- The catalogue is on this process's own proxy. A third-party plugin's
     -- ctx.get_json to 127.0.0.1 is refused unless the user allowlists it, so
     -- read the list through the node CLI, the same path health checks use.
-    -- The CLI waits until discovery has replaced the empty startup list.
-    list_models = function(_)
-      local result, err = run("models", nil, 15000)
+    -- Reload keeps maki's copy of the base URL and drops this Lua state, so
+    -- adopt that URL and bring the proxy back before asking for the list.
+    list_models = function(ctx)
+      if not (bound_port and bound_token) and type(ctx) == "table" then
+        local base = ctx.base_url
+        local headers = ctx.headers
+        local port = type(base) == "string" and base:match("^https?://127%.0%.0%.1:(%d+)/") or nil
+        local authz = type(headers) == "table" and (headers.Authorization or headers.authorization) or nil
+        local token = type(authz) == "string" and authz:match("^Bearer%s+(%S+)$") or nil
+        port = tonumber(port)
+        if port and port ~= PLACEHOLDER_PORT and token and token ~= "" then
+          bound_port = port
+          bound_token = token
+        end
+      end
+      local ready, dep_err = ensure_deps()
+      if not ready then
+        return provider_fail(dep_err or "could not install cursor proxy dependencies")
+      end
+      local running, run_err = ensure_running()
+      if not running then
+        return provider_fail(run_err or "could not start the cursor proxy")
+      end
+      local result, err = run("models", nil, 20000)
       if not result or result.exit_code ~= 0 then
-        return nil, err or failed(result, "could not list cursor models")
+        return provider_fail(err or failed(result, "could not list cursor models"))
       end
       local parsed, decode_err = maki.json.decode(trimmed(result.stdout))
       if not parsed then
-        return nil, decode_err or "cursor model list was not json"
+        return provider_fail(decode_err or "cursor model list was not json")
       end
       local rows = {}
       for _, model in ipairs(parsed.data or {}) do
@@ -298,7 +340,7 @@ function M.setup(root)
         end
       end
       if #rows == 0 then
-        return nil, "cursor model list was empty"
+        return provider_fail("cursor model list was empty")
       end
       return rows
     end,
