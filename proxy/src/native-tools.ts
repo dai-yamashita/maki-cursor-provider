@@ -600,7 +600,17 @@ function buildGrepFilesResult(content: string, clientTruncated: boolean) {
   };
 }
 
-function buildGrepContentResult(content: string, clientTruncated: boolean) {
+const MAX_GREP_LINE_NUMBER = 2_147_483_647;
+
+/** GrepContentMatch.line_number is int32; an out-of-range value fails to encode. */
+function safeLineNumber(value: string): number | null {
+  if (!/^\d+$/.test(value)) return null;
+  const number = Number.parseInt(value, 10);
+  return Number.isFinite(number) && number <= MAX_GREP_LINE_NUMBER ? number : null;
+}
+
+/** Parse the client grep tool's text output back into Cursor's structured result. */
+export function buildGrepContentResult(content: string, clientTruncated: boolean) {
   const fileMatches: ReturnType<typeof create<typeof GrepFileMatchSchema>>[] = [];
   let currentFile = "";
   let currentMatches: ReturnType<typeof create<typeof GrepContentMatchSchema>>[] = [];
@@ -616,27 +626,55 @@ function buildGrepContentResult(content: string, clientTruncated: boolean) {
     currentMatches = [];
   };
 
+  const addMatch = (lineNumber: number, text: string, isContextLine: boolean) => {
+    totalLines += 1;
+    if (!isContextLine) totalMatchedLines += 1;
+    currentMatches.push(
+      create(GrepContentMatchSchema, {
+        lineNumber,
+        content: text,
+        contentTruncated: false,
+        isContextLine,
+      }),
+    );
+  };
+
   for (const rawLine of content.split("\n")) {
     const line = rawLine.replace(/\r$/, "");
-    if (line === "--" || line === "") continue;
+    if (line === "" || line.trim() === "--") continue;
+
+    // maki renders one file per block:
+    //   path/to/file:
+    //     966: matched text
+    //     967  context text
+    //     --
+    //     970: another match
+    // File paths can contain "-<digits>-" (a planning id), so the header
+    // must be recognised before the legacy context-line fallback ever sees it.
+    const indented = line.match(/^\s+(\d+)([: ]) ?(.*)$/);
+    if (indented) {
+      const lineNumber = safeLineNumber(indented[1]!);
+      if (lineNumber === null) continue;
+      addMatch(lineNumber, indented[3]!, indented[2] === " ");
+      continue;
+    }
 
     const matchLine = line.match(/^(.+?):(\d+):(.*)/);
     if (matchLine) {
+      const lineNumber = safeLineNumber(matchLine[2]!);
+      if (lineNumber === null) continue;
       const file = matchLine[1]!;
       if (file !== currentFile) {
         flushFile();
         currentFile = file;
       }
-      totalLines += 1;
-      totalMatchedLines += 1;
-      currentMatches.push(
-        create(GrepContentMatchSchema, {
-          lineNumber: Number.parseInt(matchLine[2]!, 10),
-          content: matchLine[3]!,
-          contentTruncated: false,
-          isContextLine: false,
-        }),
-      );
+      addMatch(lineNumber, matchLine[3]!, false);
+      continue;
+    }
+
+    if (!/^\s/.test(line) && line.endsWith(":")) {
+      flushFile();
+      currentFile = line.slice(0, -1);
       continue;
     }
 
@@ -646,15 +684,7 @@ function buildGrepContentResult(content: string, clientTruncated: boolean) {
       flushFile();
       currentFile = contextLine.file;
     }
-    totalLines += 1;
-    currentMatches.push(
-      create(GrepContentMatchSchema, {
-        lineNumber: contextLine.lineNumber,
-        content: contextLine.content,
-        contentTruncated: false,
-        isContextLine: true,
-      }),
-    );
+    addMatch(contextLine.lineNumber, contextLine.content, true);
   }
 
   flushFile();
@@ -672,25 +702,31 @@ function buildGrepContentResult(content: string, clientTruncated: boolean) {
 }
 
 function parseGrepContextLine(line: string, currentFile: string) {
+  // maki writes context lines indented under their file header; those are
+  // handled above. This fallback only serves the legacy "path-line-text" form.
+  if (/^\s/.test(line)) return null;
+
   if (currentFile) {
     const prefix = `${currentFile}-`;
     if (line.startsWith(prefix)) {
       const match = line.slice(prefix.length).match(/^(\d+)-(.*)$/s);
-      if (match) {
-        return {
-          file: currentFile,
-          lineNumber: Number.parseInt(match[1]!, 10),
-          content: match[2]!,
-        };
+      const lineNumber = match ? safeLineNumber(match[1]!) : null;
+      if (lineNumber !== null) {
+        return { file: currentFile, lineNumber, content: match![2]! };
       }
     }
   }
 
   const fallback = line.match(/^(.+?)-(\d+)-(.*)$/);
   if (!fallback) return null;
+  // Require the captured "file" to look like a path, so a stray number in
+  // content cannot become the line number.
+  if (!fallback[1]!.includes("/") && !fallback[1]!.includes(".")) return null;
+  const lineNumber = safeLineNumber(fallback[2]!);
+  if (lineNumber === null) return null;
   return {
     file: fallback[1]!,
-    lineNumber: Number.parseInt(fallback[2]!, 10),
+    lineNumber,
     content: fallback[3]!,
   };
 }
