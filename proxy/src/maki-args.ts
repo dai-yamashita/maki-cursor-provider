@@ -13,7 +13,12 @@ export interface NativeCall {
     fileText?: string;
     fileBytes?: Uint8Array;
     outputMode?: string;
+    context?: number;
+    contextBefore?: number;
+    contextAfter?: number;
+    caseInsensitive?: boolean;
     multiline?: boolean;
+    type?: string;
     headLimit?: number;
   };
 }
@@ -87,10 +92,11 @@ export function makiToolArgs(
   if (call.case === "lsArgs") {
     const toolName = pick(available, ["glob"]);
     if (!toolName) return null;
+    // maki's `*` is not recursive, but Cursor's ls returns a directory tree.
     return {
       toolCallId,
       toolName,
-      args: { pattern: "*", path: call.value.path ?? "" },
+      args: { pattern: "**/*", path: call.value.path ?? "" },
     };
   }
 
@@ -106,11 +112,42 @@ export function makiToolArgs(
     }
     const toolName = pick(available, ["grep"]);
     if (!toolName) return null;
-    const args: Record<string, unknown> = { pattern: call.value.pattern || "." };
+    const args: Record<string, unknown> = { pattern: grepPattern(call.value) };
     if (call.value.path) args.path = call.value.path;
     if (call.value.glob) args.include = call.value.glob;
+    // `context` is the shorthand for the same count on both sides.
+    const contextBefore = call.value.contextBefore ?? call.value.context;
+    const contextAfter = call.value.contextAfter ?? call.value.context;
+    if ((contextBefore ?? 0) > 0) args.context_before = contextBefore;
+    if ((contextAfter ?? 0) > 0) args.context_after = contextAfter;
+    // maki caps one call at MAX_PER_CALL_LIMIT groups and names the arg `limit`.
+    if ((call.value.headLimit ?? 0) > 0) args.limit = call.value.headLimit;
+    // Cursor's `type` (file type filter) has no maki counterpart; maki's
+    // `include` is a glob, so fabricating one from a type would be wrong.
     return { toolCallId, toolName, args };
   }
 
   return null;
+}
+
+/**
+ * Cursor spells case and dotall as separate booleans, maki reads them from the
+ * regex itself. `(?i)`/`(?s)` are inline flags, so this keeps the pattern a
+ * valid regex. A pattern that already opens with its own flag group is left
+ * alone: a second group could contradict the author's intent.
+ */
+const INLINE_FLAG_GROUP = /^\(\?[a-zA-Z]+(?:-[a-zA-Z]+)?[:)]/;
+
+function grepPattern(value: NativeCall["value"]): string {
+  let pattern = value.pattern || ".";
+  const leadingFlags = pattern.match(INLINE_FLAG_GROUP)?.[1] ?? "";
+  if (value.caseInsensitive && !INLINE_FLAG_GROUP.test(pattern)) {
+    pattern = `(?i)${pattern}`;
+  }
+  // maki also auto-enables multiline for a pattern containing "\n", "(?s)",
+  // or "(?m)"; adding dotall is harmless and makes `.` span newlines.
+  if (value.multiline && !leadingFlags.includes("s") && !pattern.includes("(?s")) {
+    pattern = `(?s)${pattern}`;
+  }
+  return pattern;
 }

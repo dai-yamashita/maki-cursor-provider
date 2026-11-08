@@ -414,9 +414,16 @@ function sendShellStream(
   }
 }
 
-/** Reconstruct Cursor's directory tree from glob output (one path per line). */
-function buildLsResult(content: string, rootPath: string) {
-  const normalizedRoot = rootPath || ".";
+/**
+ * Reconstruct Cursor's directory tree from glob output (one path per line).
+ *
+ * maki's glob output mixes relative and absolute paths: `shorten_path` makes a
+ * path relative to the process cwd when it lives there, and leaves it absolute
+ * otherwise. The requested root can be either form too, so entries are matched
+ * back onto the root before the tree is built.
+ */
+export function buildLsResult(content: string, rootPath: string) {
+  const normalizedRoot = cleanLsPath(rootPath);
   const rawLines = content
     .split("\n")
     .map((line) => line.trim())
@@ -432,14 +439,11 @@ function buildLsResult(content: string, rootPath: string) {
   });
 
   const dirMap = new Map<string, LsDirectoryTreeNode>([[normalizedRoot, root]]);
+  const seenFiles = new Set<string>();
 
   for (const rawLine of rawLines) {
-    const normalized = normalizeListedPath(rawLine, normalizedRoot);
-    if (!normalized || normalized === normalizedRoot) continue;
-    const relative =
-      normalizedRoot !== "." && normalized.startsWith(`${normalizedRoot}/`)
-        ? normalized.slice(normalizedRoot.length + 1)
-        : normalized;
+    const relative = relativeToRoot(rawLine, normalizedRoot);
+    if (!relative) continue;
     const parts = relative.split("/").filter(Boolean);
     if (parts.length === 0) continue;
 
@@ -465,6 +469,9 @@ function buildLsResult(content: string, rootPath: string) {
     }
 
     const leaf = parts.at(-1)!;
+    const filePath = joinPath(currentPath, leaf);
+    if (seenFiles.has(filePath)) continue;
+    seenFiles.add(filePath);
     currentNode.childrenFiles.push(
       create(LsDirectoryTreeNode_FileSchema, { name: leaf }),
     );
@@ -480,13 +487,79 @@ function buildLsResult(content: string, rootPath: string) {
   });
 }
 
-function normalizeListedPath(path: string, rootPath: string): string {
-  const cleaned = path.replace(/\/$/, "");
-  if (!cleaned) return "";
-  if (cleaned === ".") return rootPath || ".";
-  if (cleaned.startsWith("/")) return cleaned;
-  if (rootPath && rootPath !== ".") return joinPath(rootPath, cleaned);
-  return cleaned;
+/** Normalize separators, trailing slashes, and a leading "./". */
+function cleanLsPath(path: string): string {
+  let cleaned = path.trim().replace(/\\/g, "/").replace(/\/{2,}/g, "/");
+  while (cleaned.startsWith("./")) cleaned = cleaned.slice(2);
+  cleaned = cleaned.replace(/\/+$/, "");
+  return cleaned === "" ? "." : cleaned;
+}
+
+function splitSegments(path: string): string[] {
+  return path.split("/").filter(Boolean);
+}
+
+function indexOfSegments(haystack: string[], needle: string[]): number {
+  if (needle.length === 0 || needle.length > haystack.length) return -1;
+  for (let i = 0; i + needle.length <= haystack.length; i++) {
+    let hit = true;
+    for (let j = 0; j < needle.length; j++) {
+      if (haystack[i + j] !== needle[j]) {
+        hit = false;
+        break;
+      }
+    }
+    if (hit) return i;
+  }
+  return -1;
+}
+
+/**
+ * Path of `file` below the requested root, or null when it is outside it.
+ * Handles all four absolute/relative combinations.
+ */
+function relativeToRoot(file: string, root: string): string | null {
+  const cleaned = cleanLsPath(file);
+  if (cleaned === "." || cleaned === root) return null;
+
+  if (root === ".") {
+    // Everything the root's glob returned is below it. An absolute path is
+    // resolved against the process cwd, which is the directory maki searched.
+    if (!cleaned.startsWith("/")) return cleaned;
+    const cwd = cleanLsPath(process.cwd() ?? "");
+    if (cwd !== "." && cleaned.startsWith(`${cwd}/`)) {
+      return cleaned.slice(cwd.length + 1);
+    }
+    // Unknown cwd: keep the path but drop the filesystem root marker.
+    return cleaned.slice(1);
+  }
+
+  if (cleaned.startsWith(`${root}/`)) return cleaned.slice(root.length + 1);
+
+  const rootSegments = splitSegments(root);
+  const fileSegments = splitSegments(cleaned);
+
+  // Absolute root + relative file: the root's trailing segments prefix the file.
+  const overlap = Math.min(rootSegments.length, fileSegments.length);
+  for (let count = overlap; count > 0; count--) {
+    const rootTail = rootSegments.slice(-count).join("/");
+    const fileHead = fileSegments.slice(0, count).join("/");
+    if (rootTail === fileHead) {
+      return fileSegments.slice(count).join("/") || null;
+    }
+  }
+
+  // Relative root + absolute file: the root appears inside the absolute path.
+  const at = indexOfSegments(fileSegments, rootSegments);
+  if (at >= 0) {
+    return fileSegments.slice(at + rootSegments.length).join("/") || null;
+  }
+
+  // A bare relative path names neither the root nor an ancestor, so it is
+  // already relative to the root (some glob implementations report this way).
+  if (!cleaned.startsWith("/") && !cleaned.startsWith("../")) return cleaned;
+
+  return null;
 }
 
 function joinPath(base: string, segment: string): string {
@@ -555,9 +628,26 @@ function buildGrepResult(content: string, args: Record<string, string>) {
   });
 }
 
-function buildGrepCountResult(content: string, clientTruncated: boolean) {
+export function buildGrepCountResult(content: string, clientTruncated: boolean) {
   const counts: ReturnType<typeof create<typeof GrepFileCountSchema>>[] = [];
   let totalMatches = 0;
+
+  const parsed = parseGrepMatches(content);
+  if (parsed.blockFormat) {
+    // Per-file count of real matches; context lines are not matches.
+    const perFile = new Map<string, number>();
+    for (const match of parsed.matches) {
+      if (match.isContextLine) continue;
+      perFile.set(match.file, (perFile.get(match.file) ?? 0) + 1);
+      totalMatches += 1;
+    }
+    for (const [file, count] of perFile) {
+      counts.push(create(GrepFileCountSchema, { file, count }));
+    }
+    return countResult(counts, totalMatches, clientTruncated);
+  }
+
+  // Legacy `file:count` output.
   for (const rawLine of content.split("\n")) {
     const line = rawLine.replace(/\r$/, "");
     if (!line) continue;
@@ -571,6 +661,14 @@ function buildGrepCountResult(content: string, clientTruncated: boolean) {
     totalMatches += count;
   }
 
+  return countResult(counts, totalMatches, clientTruncated);
+}
+
+function countResult(
+  counts: ReturnType<typeof create<typeof GrepFileCountSchema>>[],
+  totalMatches: number,
+  clientTruncated: boolean,
+) {
   return {
     case: "count" as const,
     value: create(GrepCountResultSchema, {
@@ -583,11 +681,25 @@ function buildGrepCountResult(content: string, clientTruncated: boolean) {
   };
 }
 
-function buildGrepFilesResult(content: string, clientTruncated: boolean) {
-  const files = content
-    .split("\n")
-    .map((line) => line.replace(/\r$/, "").trim())
-    .filter(Boolean);
+export function buildGrepFilesResult(content: string, clientTruncated: boolean) {
+  const parsed = parseGrepMatches(content);
+  const files: string[] = [];
+
+  if (parsed.blockFormat) {
+    // Only files that actually matched; a block of context lines is not a hit.
+    const seen = new Set<string>();
+    for (const match of parsed.matches) {
+      if (match.isContextLine || seen.has(match.file)) continue;
+      seen.add(match.file);
+      files.push(match.file);
+    }
+  } else {
+    // maki's glob output: one file path per line.
+    for (const rawLine of content.split("\n")) {
+      const line = rawLine.replace(/\r$/, "").trim();
+      if (line) files.push(line);
+    }
+  }
 
   return {
     case: "files" as const,
@@ -609,53 +721,53 @@ function safeLineNumber(value: string): number | null {
   return Number.isFinite(number) && number <= MAX_GREP_LINE_NUMBER ? number : null;
 }
 
-/** Parse the client grep tool's text output back into Cursor's structured result. */
-export function buildGrepContentResult(content: string, clientTruncated: boolean) {
-  const fileMatches: ReturnType<typeof create<typeof GrepFileMatchSchema>>[] = [];
+export interface ParsedGrepMatch {
+  file: string;
+  lineNumber: number;
+  content: string;
+  isContextLine: boolean;
+}
+
+export interface ParsedGrep {
+  matches: ParsedGrepMatch[];
+  /** True when at least one `path/to/file:` block header was seen. */
+  blockFormat: boolean;
+}
+
+/**
+ * Parse grep tool output into one flat, ordered match list.
+ *
+ * maki renders one block per file:
+ *   path/to/file:
+ *     966: matched text
+ *     967  context text
+ *     --
+ *     970: another match
+ *
+ * File paths can contain "-<digits>-" (a planning id), so the block header is
+ * recognised before the legacy context-line fallback ever sees it. The legacy
+ * single-line forms (`path:line:text` and `path-line-text`) still parse, which
+ * keeps older clients and flat glob output workable.
+ */
+export function parseGrepMatches(content: string): ParsedGrep {
+  const matches: ParsedGrepMatch[] = [];
   let currentFile = "";
-  let currentMatches: ReturnType<typeof create<typeof GrepContentMatchSchema>>[] = [];
-  let totalLines = 0;
-  let totalMatchedLines = 0;
+  let blockFormat = false;
 
-  const flushFile = () => {
-    if (currentFile && currentMatches.length > 0) {
-      fileMatches.push(
-        create(GrepFileMatchSchema, { file: currentFile, matches: currentMatches }),
-      );
-    }
-    currentMatches = [];
-  };
-
-  const addMatch = (lineNumber: number, text: string, isContextLine: boolean) => {
-    totalLines += 1;
-    if (!isContextLine) totalMatchedLines += 1;
-    currentMatches.push(
-      create(GrepContentMatchSchema, {
-        lineNumber,
-        content: text,
-        contentTruncated: false,
-        isContextLine,
-      }),
-    );
+  const add = (file: string, lineNumber: number, text: string, isContextLine: boolean) => {
+    if (!file) return;
+    matches.push({ file, lineNumber, content: text, isContextLine });
   };
 
   for (const rawLine of content.split("\n")) {
     const line = rawLine.replace(/\r$/, "");
     if (line === "" || line.trim() === "--") continue;
 
-    // maki renders one file per block:
-    //   path/to/file:
-    //     966: matched text
-    //     967  context text
-    //     --
-    //     970: another match
-    // File paths can contain "-<digits>-" (a planning id), so the header
-    // must be recognised before the legacy context-line fallback ever sees it.
     const indented = line.match(/^\s+(\d+)([: ]) ?(.*)$/);
     if (indented) {
       const lineNumber = safeLineNumber(indented[1]!);
       if (lineNumber === null) continue;
-      addMatch(lineNumber, indented[3]!, indented[2] === " ");
+      add(currentFile, lineNumber, indented[3]!, indented[2] === " ");
       continue;
     }
 
@@ -664,30 +776,59 @@ export function buildGrepContentResult(content: string, clientTruncated: boolean
       const lineNumber = safeLineNumber(matchLine[2]!);
       if (lineNumber === null) continue;
       const file = matchLine[1]!;
-      if (file !== currentFile) {
-        flushFile();
-        currentFile = file;
-      }
-      addMatch(lineNumber, matchLine[3]!, false);
+      if (file !== currentFile) currentFile = file;
+      add(file, lineNumber, matchLine[3]!, false);
       continue;
     }
 
     if (!/^\s/.test(line) && line.endsWith(":")) {
-      flushFile();
+      blockFormat = true;
       currentFile = line.slice(0, -1);
       continue;
     }
 
     const contextLine = parseGrepContextLine(line, currentFile);
     if (!contextLine) continue;
-    if (contextLine.file !== currentFile) {
-      flushFile();
-      currentFile = contextLine.file;
-    }
-    addMatch(contextLine.lineNumber, contextLine.content, true);
+    if (contextLine.file !== currentFile) currentFile = contextLine.file;
+    add(contextLine.file, contextLine.lineNumber, contextLine.content, true);
   }
 
-  flushFile();
+  return { matches, blockFormat };
+}
+
+/** Parse the client grep tool's text output back into Cursor's structured result. */
+export function buildGrepContentResult(content: string, clientTruncated: boolean) {
+  const fileMatches: ReturnType<typeof create<typeof GrepFileMatchSchema>>[] = [];
+  const groups = new Map<
+    string,
+    ReturnType<typeof create<typeof GrepContentMatchSchema>>[]
+  >();
+  let totalLines = 0;
+  let totalMatchedLines = 0;
+
+  for (const match of parseGrepMatches(content).matches) {
+    // totalLines counts context lines too; totalMatchedLines only real matches.
+    totalLines += 1;
+    if (!match.isContextLine) totalMatchedLines += 1;
+    let group = groups.get(match.file);
+    if (!group) {
+      group = [];
+      groups.set(match.file, group);
+    }
+    group.push(
+      create(GrepContentMatchSchema, {
+        lineNumber: match.lineNumber,
+        content: match.content,
+        contentTruncated: false,
+        isContextLine: match.isContextLine,
+      }),
+    );
+  }
+
+  for (const [file, matches] of groups) {
+    if (matches.length === 0) continue;
+    fileMatches.push(create(GrepFileMatchSchema, { file, matches }));
+  }
 
   return {
     case: "content" as const,

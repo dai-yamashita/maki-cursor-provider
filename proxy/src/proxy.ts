@@ -65,6 +65,7 @@ import {
   WriteShellStdinResultSchema,
   type AgentServerMessage,
   type ConversationStateStructure,
+  type ExecServerControlMessage,
   type ExecServerMessage,
   type InteractionQuery,
   type KvServerMessage,
@@ -156,7 +157,7 @@ interface CursorRequestPayload {
 }
 
 /** A pending tool execution waiting for results from the caller. */
-interface PendingExec {
+export interface PendingExec {
   execId: string;
   execMsgId: number;
   toolCallId: string;
@@ -1488,6 +1489,8 @@ function processServerMessage(
       sendFrame,
       onMcpExec,
     );
+  } else if (msgCase === "execServerControlMessage") {
+    handleExecControlMessage(msg.message.value as ExecServerControlMessage, state);
   } else if (msgCase === "conversationCheckpointUpdate") {
     const stateStructure = msg.message.value as ConversationStateStructure;
     if (stateStructure.tokenDetails) {
@@ -1497,6 +1500,42 @@ function processServerMessage(
       onCheckpoint(toBinary(ConversationStateStructureSchema, stateStructure));
     }
   }
+}
+
+/**
+ * Cursor cancels an exec it already asked for (`ExecServerControlMessage`
+ * abort). The exec is gone upstream, so stop tracking it and never answer it;
+ * the bridge itself stays open because other execs may still be pending.
+ */
+export function handleExecControlMessage(
+  control: ExecServerControlMessage,
+  state: { pendingExecs: PendingExec[] },
+): void {
+  if (control.message.case !== "abort") {
+    // Unknown or empty control: log and keep the turn running.
+    proxyLog(`exec control ignored case=${control.message.case ?? "none"}`);
+    return;
+  }
+  const abortId = control.message.value.id;
+  const removed = removePendingExec(state.pendingExecs, abortId);
+  proxyLog(
+    `exec abort id=${abortId} ${removed ? "dropped pending exec" : "no matching pending exec"}`,
+  );
+}
+
+/**
+ * Drop the pending exec whose `ExecServerMessage.id` matches, in place.
+ * `ActiveBridge.pendingExecs` aliases `StreamState.pendingExecs`, so a later
+ * tool-result resume only sees the removal if this same array is mutated.
+ */
+export function removePendingExec(
+  pendingExecs: PendingExec[],
+  execMsgId: number,
+): boolean {
+  const index = pendingExecs.findIndex((exec) => exec.execMsgId === execMsgId);
+  if (index === -1) return false;
+  pendingExecs.splice(index, 1);
+  return true;
 }
 
 /**
@@ -2419,12 +2458,28 @@ async function collectFullResponse(
             // A non-streaming turn cannot pause for a tool result. Reject an
             // AskQuestion explicitly so the model does not wait forever for
             // an answer this path can never deliver.
-            if (!exec.interaction) return;
-            const rejected = buildRejectedInteractionResponse(
-              exec.interaction.id,
-              "askQuestionInteractionQuery",
-            );
-            if (rejected) bridge.write(frameConnectMessage(rejected));
+            if (exec.interaction) {
+              const rejected = buildRejectedInteractionResponse(
+                exec.interaction.id,
+                "askQuestionInteractionQuery",
+              );
+              if (rejected) bridge.write(frameConnectMessage(rejected));
+              return;
+            }
+            // Any other exec (MCP tool call or redirected native tool) would
+            // also park the upstream waiting for a result this path can never
+            // deliver. Answer it with throw + streamClose instead of silence.
+            if (exec.execMsgId !== 0) {
+              proxyLog(
+                `non-streaming exec ${exec.toolName} id=${exec.execMsgId} refused`,
+              );
+              for (const frame of unavailableExec(
+                exec.execMsgId,
+                "Tools are not available in a non-streaming request.",
+              )) {
+                bridge.write(frameConnectMessage(frame));
+              }
+            }
           },
           (checkpointBytes) => {
             const stored = conversationStates.get(convKey);
