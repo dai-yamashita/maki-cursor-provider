@@ -27,7 +27,9 @@ function formatLine(message: string): string {
   let line = String(message).replace(/[\r\n]+/g, " ").trim();
   if (line === "") return "";
   if (line.length > MAX_LINE_CHARS) line = `${line.slice(0, MAX_LINE_CHARS)} ...`;
-  return `${new Date().toISOString()} ${line}\n`;
+  // The log is shared by every proxy process maki starts; without the pid a
+  // resume/stall line cannot be attributed to one session.
+  return `${new Date().toISOString()} [${process.pid}] ${line}\n`;
 }
 
 function appendLine(line: string): Promise<void> {

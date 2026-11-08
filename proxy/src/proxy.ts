@@ -262,6 +262,23 @@ const EXEC_HEARTBEAT_MS = (() => {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 3_000;
 })();
 
+/**
+ * How long a turn may go without client-visible progress before the proxy
+ * gives up. SSE keepalives exist so reqwest's 120 s low-speed timeout never
+ * fires during a long think, but maki re-arms its own 300 s deadline on every
+ * SSE *line*, comments included. A bridge that is alive (Cursor heartbeats)
+ * but silent would therefore hang forever. This deadline is measured on
+ * model progress only: heartbeats and usage-only updates do not reset it.
+ */
+const STREAM_STALL_TIMEOUT_MS = (() => {
+  const raw = process.env.CURSOR_STREAM_STALL_TIMEOUT_MS;
+  const parsed = raw === undefined ? Number.NaN : Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 300_000;
+})();
+
+/** A Connect message larger than this cannot be a real model frame. */
+const MAX_CONNECT_FRAME_BYTES = 64 * 1024 * 1024;
+
 interface StoredConversation {
   conversationId: string;
   checkpoint: Uint8Array | null;
@@ -1042,6 +1059,17 @@ async function handleChatCompletion(
   evictStaleBridges();
 
   const activeBridge = activeBridges.get(lookupBridgeKey);
+  const isResume = Boolean(activeBridge && toolResults.length > 0);
+  proxyLog(
+    `request model=${modelId} messages=${body.messages.length} tools=${tools.length} ` +
+      `results=${toolResults.length} resume=${isResume} key=${lookupBridgeKey}`,
+  );
+  if (!activeBridge && toolResults.length > 0) {
+    // A resume whose key does not match the paused bridge would silently start
+    // a new conversation. Make that visible; it is otherwise indistinguishable
+    // from a normal request.
+    proxyLog(`resume key=${lookupBridgeKey} missed; starting a fresh bridge`);
+  }
 
   if (activeBridge && toolResults.length > 0) {
     activeBridges.delete(lookupBridgeKey);
@@ -1410,17 +1438,43 @@ function makeHeartbeatBytes(): Uint8Array {
 /**
  * Create a stateful parser for Connect protocol frames.
  * Handles buffering partial data across chunks.
+ *
+ * A body that is not Connect-framed (for example an edge proxy returning
+ * `{"error":...}` with a 200) must never be mistaken for a frame: the old
+ * parser read the JSON as flags+length and waited forever for gigabytes.
+ * Invalid flags/length call `onProtocolError` with a short body excerpt so
+ * the caller can surface a real error instead of hanging.
  */
 function createConnectFrameParser(
   onMessage: (bytes: Uint8Array) => void,
   onEndStream: (bytes: Uint8Array) => void,
+  onProtocolError?: (message: string) => void,
 ): (incoming: Buffer) => void {
   let pending = Buffer.alloc(0);
+  let failed = false;
+  const fail = (why: string) => {
+    if (failed) return;
+    failed = true;
+    const body = pending.subarray(0, 400).toString("utf8").replace(/\s+/g, " ").trim();
+    pending = Buffer.alloc(0);
+    onProtocolError?.(body ? `${why}: ${body}` : why);
+  };
   return (incoming: Buffer) => {
+    if (failed) return;
     pending = Buffer.concat([pending, incoming]);
     while (pending.length >= 5) {
       const flags = pending[0]!;
+      // Connect/gRPC flags only define compressed (0x01) and end-stream
+      // (0x02). Anything else is an unframed body, not a length header.
+      if ((flags & ~0x03) !== 0) {
+        fail(`invalid Connect frame flags 0x${flags.toString(16)}`);
+        return;
+      }
       const msgLen = pending.readUInt32BE(1);
+      if (msgLen > MAX_CONNECT_FRAME_BYTES) {
+        fail(`Connect frame too large (${msgLen} bytes)`);
+        return;
+      }
       if (pending.length < 5 + msgLen) break;
       const messageBytes = pending.subarray(5, 5 + msgLen);
       pending = pending.subarray(5 + msgLen);
@@ -1431,6 +1485,19 @@ function createConnectFrameParser(
       }
     }
   };
+}
+
+/**
+ * True when a server message is real model progress. Cursor keeps a run alive
+ * with `heartbeat` updates and usage-only `tokenDelta` updates; counting those
+ * as progress is what let a stalled turn survive for tens of minutes.
+ */
+export function serverMessageIsProgress(msg: AgentServerMessage): boolean {
+  const messageCase = msg.message.case;
+  if (messageCase === undefined) return false;
+  if (messageCase !== "interactionUpdate") return true;
+  const updateCase = (msg.message.value as { message?: { case?: string } }).message?.case;
+  return updateCase !== "heartbeat" && updateCase !== "tokenDelta";
 }
 
 const THINKING_TAG_NAMES = ['think', 'thinking', 'reasoning', 'thought', 'think_intent'];
@@ -2068,6 +2135,7 @@ function createBridgeStreamResponse(
   // shutdown exactly once.
   let keepaliveTimer: NodeJS.Timeout | undefined;
   let turnEndTimer: NodeJS.Timeout | undefined;
+  let stallTimer: NodeJS.Timeout | undefined;
   let shutdown: () => void = () => {};
 
   const stream = new ReadableStream({
@@ -2103,6 +2171,7 @@ function createBridgeStreamResponse(
 
       const closeController = () => {
         stopKeepalive();
+        stopStall();
         if (closed) return;
         closed = true;
         try {
@@ -2119,6 +2188,7 @@ function createBridgeStreamResponse(
        */
       shutdown = () => {
         stopKeepalive();
+        stopStall();
         if (turnEndTimer !== undefined) {
           clearTimeout(turnEndTimer);
           turnEndTimer = undefined;
@@ -2145,6 +2215,7 @@ function createBridgeStreamResponse(
       keepaliveTimer = setInterval(() => enqueue(": keepalive\n\n"), SSE_KEEPALIVE_MS);
       // Do not hold the process open just for a heartbeat comment.
       keepaliveTimer.unref?.();
+      armStall();
 
       const makeChunk = (
         delta: Record<string, unknown>,
@@ -2179,6 +2250,52 @@ function createBridgeStreamResponse(
 
       let mcpExecReceived = false;
 
+      // --- Stall watchdog -------------------------------------------------
+      // Cursor keeps a run alive with heartbeats, and maki re-arms its own
+      // deadline on every SSE line (keepalives included). Without a progress
+      // deadline here, "alive but stuck" looks identical to "still thinking"
+      // forever. Only client-visible model progress resets this timer.
+      const caseCounts = new Map<string, number>();
+      const bumpCase = (messageCase: string) => {
+        caseCounts.set(messageCase, (caseCounts.get(messageCase) ?? 0) + 1);
+      };
+      const formatCaseCounts = () =>
+        [...caseCounts.entries()].map(([name, count]) => `${name}:${count}`).join(",") || "none";
+      const stalledSeconds = Math.max(1, Math.round(STREAM_STALL_TIMEOUT_MS / 1000));
+
+      function stopStall() {
+        if (stallTimer === undefined) return;
+        clearTimeout(stallTimer);
+        stallTimer = undefined;
+      }
+
+      function onStall() {
+        stallTimer = undefined;
+        if (closed) return;
+        proxyLog(
+          `bridge ${bridgeKey} stalled: no model progress for ${stalledSeconds}s ` +
+            `(server messages ${formatCaseCounts()})`,
+        );
+        sendSSE(makeChunk({
+          content: `\n[Error: cursor stream stalled for ${stalledSeconds}s without output; retry the request]`,
+        }));
+        sendSSE(makeChunk({}, "stop"));
+        sendSSE(makeUsageChunk());
+        sendDone();
+        closeController();
+        shutdown();
+      }
+
+      function armStall() {
+        stopStall();
+        if (STREAM_STALL_TIMEOUT_MS <= 0) return;
+        stallTimer = setTimeout(onStall, STREAM_STALL_TIMEOUT_MS);
+        stallTimer.unref?.();
+      }
+
+      /** Reset the deadline only for client-visible model progress. */
+      const noteProgress = () => armStall();
+
       /** Close the turn without tearing the bridge down immediately. */
       const finishTurn = () => {
         if (pausedForToolResult) return;
@@ -2208,6 +2325,8 @@ function createBridgeStreamResponse(
               AgentServerMessageSchema,
               messageBytes,
             );
+            bumpCase(serverMessage.message.case ?? "none");
+            if (serverMessageIsProgress(serverMessage)) noteProgress();
             processServerMessage(
               serverMessage,
               blobStore,
@@ -2296,6 +2415,7 @@ function createBridgeStreamResponse(
           }
         },
         (endStreamBytes) => {
+          noteProgress();
           if (endStreamBytes.length === 0) {
             finishTurn();
             return;
@@ -2316,6 +2436,20 @@ function createBridgeStreamResponse(
             closeController();
             shutdown();
           }
+        },
+        (protocolError) => {
+          // A 200 response whose body is not Connect-framed (often an edge
+          // proxy's JSON error) must become a visible failure, not silence.
+          proxyLog(`cursor protocol error: ${protocolError}`);
+          if (closed) return;
+          sendSSE(makeChunk({
+            content: `\n[Error: cursor upstream sent an unframed response: ${protocolError}]`,
+          }));
+          sendSSE(makeChunk({}, "stop"));
+          sendSSE(makeUsageChunk());
+          sendDone();
+          closeController();
+          shutdown();
         },
       );
 
@@ -2626,7 +2760,39 @@ async function collectFullResponse(
 
   const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes);
 
+  // Connect's end-stream frame carries a server error after the last message.
+  // Without recording it, a failed run looked like a clean "stop" with
+  // whatever text had streamed so far.
+  let endError: Error | null = null;
+
+  // Same progress deadline as the streaming path: a non-streaming request must
+  // not sit on an alive-but-stuck bridge forever either. These are defined
+  // before onAbort because an already-aborted signal calls it synchronously.
+  let stallTimer: NodeJS.Timeout | undefined;
+  const stopStall = () => {
+    if (stallTimer === undefined) return;
+    clearTimeout(stallTimer);
+    stallTimer = undefined;
+  };
+  const stalledSeconds = Math.max(1, Math.round(STREAM_STALL_TIMEOUT_MS / 1000));
+  const onStall = () => {
+    stallTimer = undefined;
+    if (endError) return;
+    endError = new Error(`cursor stream stalled for ${stalledSeconds}s without output`);
+    proxyLog(`non-streaming bridge stalled: no model progress for ${stalledSeconds}s`);
+    clearInterval(heartbeatTimer);
+    closeBridgeGracefully(bridge);
+  };
+  const armStall = () => {
+    stopStall();
+    if (STREAM_STALL_TIMEOUT_MS <= 0) return;
+    stallTimer = setTimeout(onStall, STREAM_STALL_TIMEOUT_MS);
+    stallTimer.unref?.();
+  };
+  const noteProgress = () => armStall();
+
   const onAbort = () => {
+    stopStall();
     clearInterval(heartbeatTimer);
     closeBridgeGracefully(bridge);
     reject(new Error("client aborted"));
@@ -2644,10 +2810,6 @@ async function collectFullResponse(
     totalTokens: 0,
   };
   const tagFilter = createThinkingTagFilter();
-  // Connect's end-stream frame carries a server error after the last message.
-  // Without recording it, a failed run looked like a clean "stop" with
-  // whatever text had streamed so far.
-  let endError: Error | null = null;
 
   bridge.onData(createConnectFrameParser(
     (messageBytes) => {
@@ -2656,6 +2818,7 @@ async function collectFullResponse(
           AgentServerMessageSchema,
           messageBytes,
         );
+        if (serverMessageIsProgress(serverMessage)) noteProgress();
         processServerMessage(
           serverMessage,
           payload.blobStore,
@@ -2716,6 +2879,7 @@ async function collectFullResponse(
       }
     },
     (endStreamBytes) => {
+      noteProgress();
       // A zero-length end-stream frame carries no JSON; treat it as a clean
       // end rather than a parse failure.
       if (endStreamBytes.length === 0) {
@@ -2732,9 +2896,17 @@ async function collectFullResponse(
       clearInterval(heartbeatTimer);
       closeBridgeGracefully(bridge);
     },
+    (protocolError) => {
+      endError = new Error(`unframed upstream response: ${protocolError}`);
+      proxyLog(`cursor protocol error: ${endError.message}`);
+      clearInterval(heartbeatTimer);
+      closeBridgeGracefully(bridge);
+    },
   ));
+  armStall();
 
   bridge.onClose((code) => {
+    stopStall();
     clearInterval(heartbeatTimer);
     signal?.removeEventListener("abort", onAbort);
     const stored = conversationStates.get(convKey);

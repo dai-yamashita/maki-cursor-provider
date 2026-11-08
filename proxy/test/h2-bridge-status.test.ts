@@ -213,3 +213,42 @@ test("a failed connection is reported as an upstream error", { timeout: 15_000 }
   assertFailedExit(result);
   assert.match(result.stderr, /\[h2-bridge\] upstream error: .*ECONNREFUSED/);
 });
+
+test("a 429 body is reported so the capacity reason reaches the caller", { timeout: 15_000 }, async () => {
+  // Cursor answers a refused prefill with a non-200 JSON body. Reporting only
+  // "upstream status 429" hid the actionable part ("prefill_cap_refused").
+  const { server, port } = await startUpstream((stream) => {
+    stream.respond({ ":status": 429, "content-type": "application/json" });
+    stream.end(
+      '{"error":{"type":"server_error","message":"Upstream request failed: [prefill_cap_refused] the Audit cell is at capacity"}}',
+    );
+  });
+
+  try {
+    const result = await runBridge(port);
+    assertFailedExit(result);
+    assert.match(result.stderr, /\[h2-bridge\] upstream status 429/);
+    assert.match(result.stderr, /prefill_cap_refused/);
+  } finally {
+    await stopUpstream(server);
+  }
+});
+
+test("a 200 response with a non-Connect body is reported, not parsed as frames", { timeout: 15_000 }, async () => {
+  // A 200 is not enough: an edge error returned as JSON cannot be a Connect
+  // frame. The bridge must forward the reason instead of letting the parent
+  // wait for a frame that will never arrive.
+  const { server, port } = await startUpstream((stream) => {
+    stream.respond({ ":status": 200, "content-type": "application/json" });
+    stream.end('{"error":{"message":"prefill_cap_refused: at capacity"}}');
+  });
+
+  try {
+    const result = await runBridge(port);
+    assertFailedExit(result);
+    assert.match(result.stderr, /\[h2-bridge\] upstream content-type application\/json/);
+    assert.match(result.stderr, /prefill_cap_refused/);
+  } finally {
+    await stopUpstream(server);
+  }
+});

@@ -82,10 +82,29 @@ async function serve(): Promise<void> {
       process.exit(1);
     });
   };
+  // A bridge's stdin can close mid-write. Every pipe has its own error
+  // handler; this is the last line of defence so one dead child never takes
+  // down every other session served by this proxy.
+  const isChildPipeError = (err: unknown): boolean => {
+    const code = (err as NodeJS.ErrnoException | undefined)?.code;
+    return code === "EPIPE" || code === "ECONNRESET";
+  };
   process.on("uncaughtException", (err) => {
+    if (isChildPipeError(err)) {
+      void proxyLogAndWait(
+        `ignored child pipe error: ${(err as NodeJS.ErrnoException).code}`,
+      );
+      return;
+    }
     failFromServe("uncaughtException", err);
   });
   process.on("unhandledRejection", (reason) => {
+    if (isChildPipeError(reason)) {
+      void proxyLogAndWait(
+        `ignored child pipe rejection: ${(reason as NodeJS.ErrnoException).code}`,
+      );
+      return;
+    }
     failFromServe("unhandledRejection", reason);
   });
 

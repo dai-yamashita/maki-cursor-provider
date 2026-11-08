@@ -184,29 +184,76 @@ if (!unary) {
 }
 const h2Stream = client.request(headers);
 
-// Record the upstream HTTP status so a non-200 response is never silent.
-// A non-200 cannot be turned into a useful completion, so end the bridge with
-// a non-zero code: the parent turns that into an error instead of an empty
-// successful answer.
+// Record the upstream HTTP status and content type so a non-200 response or
+// an unframed error body is never silent. Read a bounded slice of the body so
+// the caller can show Cursor's actual reason (for example
+// "prefill_cap_refused") instead of a bare exit code.
+const MAX_ERROR_BODY = 8 * 1024;
+let upstreamRejected = false;
+let rejectFinalized = false;
+let errorBody = "";
+let errorBodyTimer;
+
+function finalizeReject() {
+  if (rejectFinalized) return;
+  rejectFinalized = true;
+  if (errorBodyTimer) clearTimeout(errorBodyTimer);
+  const detail = errorBody.replace(/\s+/g, " ").trim().slice(0, 1000);
+  logStderr(`upstream error body: ${detail || "(empty)"}`);
+  clearTimeout(timeout);
+  try {
+    client.close();
+  } catch {
+    // Already gone.
+  }
+  process.exit(1);
+}
+
+function beginUpstreamReject(reason) {
+  if (upstreamRejected) return;
+  upstreamRejected = true;
+  logStderr(reason);
+  clearTimeout(timeout);
+  // Do not wait forever for a body that may never arrive.
+  errorBodyTimer = setTimeout(finalizeReject, 2_000);
+  errorBodyTimer.unref?.();
+}
+
 h2Stream.on("response", (responseHeaders) => {
   const raw = responseHeaders[":status"];
   const status = typeof raw === "number" ? raw : Number(raw);
+  const contentType = String(responseHeaders["content-type"] ?? "");
   if (!Number.isFinite(status)) return;
   if (status !== 200) {
-    logStderr(`upstream status ${status}`);
-    clearTimeout(timeout);
-    client.destroy();
-    process.exit(1);
+    beginUpstreamReject(`upstream status ${status}`);
+    return;
+  }
+  // A streaming request must get Connect/gRPC framing (both use the same
+  // 5-byte frame header). A JSON body (edge/proxy error) cannot be parsed as
+  // frames; report it instead of hanging.
+  const framed =
+    contentType.includes("application/connect+") ||
+    contentType.includes("application/grpc");
+  if (!unary && contentType && !framed) {
+    beginUpstreamReject(`upstream content-type ${contentType.slice(0, 80)}`);
   }
 });
 
 // Forward H2 response data → stdout (length-prefixed)
 h2Stream.on("data", (chunk) => {
+  if (upstreamRejected) {
+    if (errorBody.length < MAX_ERROR_BODY) errorBody += chunk.toString("utf8");
+    return;
+  }
   resetTimeout();
   writeMessage(chunk);
 });
 
 h2Stream.on("end", () => {
+  if (upstreamRejected) {
+    finalizeReject();
+    return;
+  }
   clearTimeout(timeout);
   // The server finished its response. Half-close our side on a later tick so
   // a reset delivered in the same turn is still seen: closing synchronously
@@ -222,6 +269,10 @@ h2Stream.on("end", () => {
 });
 
 h2Stream.on("close", () => {
+  if (upstreamRejected) {
+    finalizeReject();
+    return;
+  }
   // rstCode is 0 for a clean end and non-zero when the peer reset the stream.
   // Decide the exit code here, after 'close' has seen rstCode: exiting from
   // 'end' with 0 made a truncated answer look like a completed one.
