@@ -21,7 +21,7 @@
 import http2 from "node:http2";
 import crypto from "node:crypto";
 
-const CURSOR_CLIENT_VERSION = "cli-2026.01.09-231024f";
+const CURSOR_CLIENT_VERSION = "cli-2026.11.05-86047df";
 
 /** Write one length-prefixed message to stdout. */
 function writeMessage(data) {

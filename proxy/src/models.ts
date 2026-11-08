@@ -5,6 +5,8 @@
  */
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { z } from "zod";
+import { fetchAvailableModels } from "./available-models.ts";
+import { pickerRows, rememberAvailableModels, clearAvailableModels } from "./catalog.ts";
 import { callCursorUnaryRpc } from "./proxy.ts";
 import {
   GetUsableModelsRequestSchema,
@@ -108,15 +110,38 @@ export async function getCursorModels(
   apiKey: string,
 ): Promise<CursorModel[]> {
   if (cachedModels) return cachedModels;
-  const discovered = apiKey ? await fetchCursorUsableModels(apiKey) : null;
-  const models = discovered && discovered.length > 0 ? discovered : FALLBACK_MODELS;
-  cachedModels = models.some((m) => m.id === AUTO_MODEL.id) ? models : [AUTO_MODEL, ...models];
+  const [discovered, available] = await Promise.all([
+    apiKey ? fetchCursorUsableModels(apiKey) : Promise.resolve(null),
+    apiKey ? fetchAvailableModels(apiKey) : Promise.resolve([]),
+  ]);
+  rememberAvailableModels(available);
+  const base = discovered && discovered.length > 0
+    ? discovered
+    : available.length > 0
+      ? []
+      : FALLBACK_MODELS;
+  const byId = new Map(base.map((model) => [model.id, model]));
+  for (const row of pickerRows(available)) {
+    if (byId.has(row.id)) continue;
+    byId.set(row.id, {
+      id: row.id,
+      name: row.name,
+      reasoning: true,
+      contextWindow: DEFAULT_CONTEXT_WINDOW,
+      maxTokens: DEFAULT_MAX_TOKENS,
+    });
+  }
+  const models = [...byId.values()].sort((a, b) => a.id.localeCompare(b.id));
+  cachedModels = models.some((model) => model.id === AUTO_MODEL.id)
+    ? models
+    : [AUTO_MODEL, ...models];
   return cachedModels;
 }
 
 /** @internal Test-only. */
 export function clearModelCache(): void {
   cachedModels = null;
+  clearAvailableModels();
 }
 
 function decodeGetUsableModelsResponse(payload: Uint8Array): {

@@ -50,6 +50,7 @@ import {
   ReadResultSchema,
   RequestContextResultSchema,
   RequestedModelSchema,
+  RequestedModel_ModelParameterbytesSchema,
   RequestContextSchema,
   RequestContextSuccessSchema,
   ResumeActionSchema,
@@ -68,6 +69,7 @@ import {
   type KvServerMessage,
   type McpToolDefinition,
 } from "./proto/agent_pb.ts";
+import { resolveCursorModel } from "./catalog.ts";
 import {
   redirectNativeExec,
   sendNativeExecResult,
@@ -1007,14 +1009,21 @@ function buildCursorRequest(
 
   // "auto" is the proxy's pseudo-model for Cursor's server-side Auto
   // routing; the Run API expects modelId "default" for it.
-  const cursorModelId = modelId === "auto" ? "default" : modelId;
+  // A picker id from AvailableModels (glm-5p3-flash-high) is the family plus
+  // the effort parameters. GetUsableModels ids that are not in that catalogue
+  // pass through unchanged.
+  const picked = modelId === "auto"
+    ? { modelId: "default", parameters: [], maxMode: false }
+    : resolveCursorModel(modelId) ?? { modelId, parameters: [], maxMode: false };
   const displayName = modelId === "auto" ? "Auto" : modelId;
   const requestedModel = create(RequestedModelSchema, {
-    modelId: cursorModelId,
+    modelId: picked.modelId,
+    maxMode: picked.maxMode,
+    parameters: picked.parameters.map((parameter) => create(RequestedModel_ModelParameterbytesSchema, parameter)),
   });
   const modelDetails = create(ModelDetailsSchema, {
-    modelId: cursorModelId,
-    displayModelId: cursorModelId,
+    modelId: picked.modelId,
+    displayModelId: picked.modelId,
     displayName,
     displayNameShort: displayName,
   });
