@@ -86,6 +86,7 @@ const logPath = join(logDir, "proxy.log");
 
 process.env.CURSOR_API_URL = `http://127.0.0.1:${upstreamPort}`;
 process.env.CURSOR_SSE_KEEPALIVE_MS = "100";
+process.env.CURSOR_EXEC_HEARTBEAT_MS = "50";
 process.env.MAKI_CURSOR_CONVERSATIONS = conversationDir;
 process.env.MAKI_CURSOR_CREDENTIALS = join(logDir, "credentials.json");
 delete process.env.CURSOR_PROXY_DEBUG;
@@ -276,6 +277,39 @@ test("an empty exec control case is ignored without throwing", () => {
     handleExecControlMessage(create(ExecServerControlMessageSchema, {}), state),
   );
   assert.equal(state.pendingExecs.length, 1);
+});
+
+test("a parked exec sends exec heartbeat frames", { timeout: 15_000 }, async () => {
+  let clientMessages: AgentClientMessage[] = [];
+
+  onStream = (stream) => {
+    respondSilent(stream);
+    clientMessages = attachClientParser(stream);
+    stream.write(mcpExecFrame(7, "call_heartbeat"));
+  };
+
+  const port = await startProxy(async () => "unused", [], 0, TOKEN);
+  try {
+    const first = await withTimeout(
+      chatRequest(port, streamBody(), "session-heartbeat"),
+      5_000,
+      "no response headers",
+    );
+    await withTimeout(readAll(first), 10_000, "the tool-call turn hung");
+
+    await pollUntil(
+      () => clientMessages.some(
+        (message) =>
+          message.message.case === "execClientControlMessage" &&
+          message.message.value.message.case === "heartbeat" &&
+          message.message.value.message.value.id === 7,
+      ),
+      1_500,
+      "the proxy never sent an exec heartbeat",
+    );
+  } finally {
+    stopProxy();
+  }
 });
 
 // --- Integration tests ---------------------------------------------------------------

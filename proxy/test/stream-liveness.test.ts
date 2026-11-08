@@ -31,6 +31,7 @@ import {
   InteractionQuerySchema,
   InteractionUpdateSchema,
   TextDeltaUpdateSchema,
+  TurnEndedUpdateSchema,
 } from "../src/proto/agent_pb.ts";
 
 const TOKEN = "test-token";
@@ -136,6 +137,17 @@ function textFrame(text: string): Buffer {
       case: "textDelta",
       value: create(TextDeltaUpdateSchema, { text }),
     },
+  });
+  const message = create(AgentServerMessageSchema, {
+    message: { case: "interactionUpdate", value: update },
+  });
+  return connectFrame(toBinary(AgentServerMessageSchema, message));
+}
+
+/** One Connect data frame carrying an interaction update with no payload. */
+function turnEndedFrame(): Buffer {
+  const update = create(InteractionUpdateSchema, {
+    message: { case: "turnEnded", value: create(TurnEndedUpdateSchema, {}) },
   });
   const message = create(AgentServerMessageSchema, {
     message: { case: "interactionUpdate", value: update },
@@ -751,6 +763,27 @@ test("an async AskQuestion is rejected instead of falsely succeeding", { timeout
     const answer = interaction.message.value.result;
     assert.equal(answer.case, "askQuestionInteractionResponse");
     assert.equal(answer.value.result?.result.case, "rejected");
+  } finally {
+    stopProxy();
+  }
+});
+
+test("turnEnded closes the SSE even when the upstream stays open", { timeout: 15_000 }, async () => {
+  upstreamSetup((stream) => {
+    respondSilent(stream);
+    stream.write(textFrame("done"));
+    stream.write(turnEndedFrame());
+    // Deliberately leave the HTTP/2 stream open: the proxy must finish on
+    // turnEnded rather than waiting for a close that never comes.
+  });
+
+  const port = await startProxy(async () => "unused", [], 0, TOKEN);
+  try {
+    const response = await withTimeout(chatRequest(port), 5_000, "no response headers");
+    const text = await withTimeout(readAll(response), 5_000, "turnEnded did not close the SSE");
+    assert.match(text, /"content":"done"/);
+    assert.match(text, /"finish_reason":"stop"/);
+    assert.match(text, /data: \[DONE\]/);
   } finally {
     stopProxy();
   }

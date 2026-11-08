@@ -220,6 +220,22 @@ export function buildAskQuestionResponse(id: number, result: AskQuestionResult):
   return toBinary(AgentClientMessageSchema, client);
 }
 
+/**
+ * An InteractionResponse carrying only the id and no result case.
+ *
+ * Newer Cursor builds send queries this generated schema does not name
+ * (webFetch, prManagement, mcpAuth, generateImage, replaceEnv, connectScm).
+ * The upstream still expects one response per interaction id on the open run;
+ * an id-only response is the only safe reply and keeps the turn from hanging.
+ */
+export function buildEmptyInteractionResponse(id: number): Uint8Array {
+  const response = create(InteractionResponseSchema, { id });
+  const client = create(AgentClientMessageSchema, {
+    message: { case: "interactionResponse", value: response },
+  });
+  return toBinary(AgentClientMessageSchema, client);
+}
+
 /** A rejection for a query this client cannot service, so the model never hangs. */
 export function buildRejectedInteractionResponse(id: number, queryCase: string): Uint8Array | null {
   if (queryCase === "askQuestionInteractionQuery") {

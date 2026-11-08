@@ -27,16 +27,23 @@ import {
   ConversationTurnStructureSchema,
   AssistantMessageSchema,
   BackgroundShellSpawnResultSchema,
+  ComputerUseErrorSchema,
+  ComputerUseResultSchema,
   DeleteResultSchema,
   DeleteRejectedSchema,
   DiagnosticsResultSchema,
+  DiagnosticsSuccessSchema,
   ExecClientMessageSchema,
+  ExecClientControlMessageSchema,
+  ExecClientHeartbeatSchema,
   FetchErrorSchema,
   FetchResultSchema,
   GetBlobResultSchema,
   GrepErrorSchema,
   GrepResultSchema,
   KvClientMessageSchema,
+  ListMcpResourcesExecResultSchema,
+  ListMcpResourcesSuccessSchema,
   LsRejectedSchema,
   LsResultSchema,
   McpErrorSchema,
@@ -46,8 +53,12 @@ import {
   McpToolDefinitionSchema,
   McpToolResultContentItemSchema,
   ModelDetailsSchema,
+  ReadMcpResourceErrorSchema,
+  ReadMcpResourceExecResultSchema,
   ReadRejectedSchema,
   ReadResultSchema,
+  RecordScreenFailureSchema,
+  RecordScreenResultSchema,
   RequestContextResultSchema,
   RequestedModelSchema,
   RequestedModel_ModelParameterbytesSchema,
@@ -57,6 +68,7 @@ import {
   SetBlobResultSchema,
   ShellRejectedSchema,
   ShellResultSchema,
+  ShellStreamSchema,
   UserMessageActionSchema,
   UserMessageSchema,
   WriteRejectedSchema,
@@ -93,6 +105,7 @@ import { classifyExec, streamCloseMessage, unavailableExec } from "./exec-reply.
 import {
   buildAskQuestionResponse,
   buildAskQuestionResult,
+  buildEmptyInteractionResponse,
   buildQuestionToolArgs,
   buildRejectedInteractionResponse,
   QUESTION_TOOL_NAME,
@@ -168,6 +181,8 @@ export interface PendingExec {
   native?: NativeExecBinding;
   /** Set when this tool call is a Cursor AskQuestion waiting for the user. */
   interaction?: AskQuestionInteraction;
+  /** Per-exec liveness ping while the tool runs; cleared when answered. */
+  heartbeatTimer?: NodeJS.Timeout;
 }
 
 /** A bridge kept alive across requests for tool result continuation. */
@@ -189,6 +204,7 @@ interface ActiveBridge {
  */
 function destroyActiveBridge(key: string, active: ActiveBridge): void {
   clearInterval(active.heartbeatTimer);
+  clearPendingExecTimers(active.pendingExecs);
   if (activeBridges.get(key) === active) activeBridges.delete(key);
   // An unanswered AskQuestion must not leave the upstream waiting on the
   // interaction after we reap the bridge. Tell it the question was rejected.
@@ -237,6 +253,13 @@ const SSE_KEEPALIVE_MS = (() => {
   // An unparseable or non-positive value falls back to the default rather
   // than failing a request.
   return Number.isFinite(parsed) && parsed > 0 ? parsed : 15_000;
+})();
+
+/** How often to prove to Cursor that an outstanding exec is still alive. */
+const EXEC_HEARTBEAT_MS = (() => {
+  const raw = process.env.CURSOR_EXEC_HEARTBEAT_MS;
+  const parsed = raw === undefined ? Number.NaN : Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 3_000;
 })();
 
 interface StoredConversation {
@@ -382,6 +405,29 @@ function frameConnectMessage(data: Uint8Array, flags = 0): Buffer {
   frame.writeUInt32BE(data.length, 1);
   frame.set(data, 5);
   return frame;
+}
+
+/** An AgentClientMessage telling Cursor an outstanding exec is still alive. */
+function makeExecHeartbeat(id: number): Uint8Array {
+  const control = create(ExecClientControlMessageSchema, {
+    message: {
+      case: "heartbeat",
+      value: create(ExecClientHeartbeatSchema, { id }),
+    },
+  });
+  const client = create(AgentClientMessageSchema, {
+    message: { case: "execClientControlMessage", value: control },
+  });
+  return toBinary(AgentClientMessageSchema, client);
+}
+
+/** Stop every per-exec heartbeat a paused bridge still owns. */
+function clearPendingExecTimers(execs: readonly PendingExec[]): void {
+  for (const exec of execs) {
+    if (!exec.heartbeatTimer) continue;
+    clearInterval(exec.heartbeatTimer);
+    exec.heartbeatTimer = undefined;
+  }
 }
 
 /**
@@ -1466,38 +1512,64 @@ function processServerMessage(
   state: StreamState,
   onText: (text: string, isThinking?: boolean) => void,
   onMcpExec: (exec: PendingExec) => void,
+  onTurnEnded?: () => void,
   onCheckpoint?: (checkpointBytes: Uint8Array) => void,
 ): void {
   const msgCase = msg.message.case;
 
-  if (msgCase === "interactionUpdate") {
-    handleInteractionUpdate(msg.message.value, state, onText);
-  } else if (msgCase === "kvServerMessage") {
-    handleKvMessage(msg.message.value as KvServerMessage, blobStore, sendFrame);
-  } else if (msgCase === "execServerMessage") {
-    handleExecMessage(
-      msg.message.value as ExecServerMessage,
-      mcpTools,
-      cloudRule,
-      sendFrame,
-      onMcpExec,
-    );
-  } else if (msgCase === "interactionQuery") {
-    handleInteractionQuery(
-      msg.message.value as InteractionQuery,
-      mcpTools,
-      sendFrame,
-      onMcpExec,
-    );
-  } else if (msgCase === "execServerControlMessage") {
-    handleExecControlMessage(msg.message.value as ExecServerControlMessage, state);
-  } else if (msgCase === "conversationCheckpointUpdate") {
-    const stateStructure = msg.message.value as ConversationStateStructure;
-    if (stateStructure.tokenDetails) {
-      state.totalTokens = stateStructure.tokenDetails.usedTokens;
+  try {
+    if (msgCase === "interactionUpdate") {
+      handleInteractionUpdate(msg.message.value, state, onText, onTurnEnded);
+    } else if (msgCase === "kvServerMessage") {
+      handleKvMessage(msg.message.value as KvServerMessage, blobStore, sendFrame);
+    } else if (msgCase === "execServerMessage") {
+      handleExecMessage(
+        msg.message.value as ExecServerMessage,
+        mcpTools,
+        cloudRule,
+        sendFrame,
+        onMcpExec,
+      );
+    } else if (msgCase === "interactionQuery") {
+      handleInteractionQuery(
+        msg.message.value as InteractionQuery,
+        mcpTools,
+        sendFrame,
+        onMcpExec,
+      );
+    } else if (msgCase === "execServerControlMessage") {
+      handleExecControlMessage(msg.message.value as ExecServerControlMessage, state);
+    } else if (msgCase === "conversationCheckpointUpdate") {
+      const stateStructure = msg.message.value as ConversationStateStructure;
+      if (stateStructure.tokenDetails) {
+        state.totalTokens = stateStructure.tokenDetails.usedTokens;
+      }
+      if (onCheckpoint) {
+        onCheckpoint(toBinary(ConversationStateStructureSchema, stateStructure));
+      }
     }
-    if (onCheckpoint) {
-      onCheckpoint(toBinary(ConversationStateStructureSchema, stateStructure));
+  } catch (err) {
+    // A malformed message must not drop a request the server is waiting on.
+    const message = err instanceof Error ? err.message : String(err);
+    proxyLog(`message handler failed case=${msgCase ?? "none"}: ${message}`);
+    if (msgCase === "execServerMessage") {
+      const exec = msg.message.value as ExecServerMessage;
+      // If the handler already emitted the tool call, its result will answer
+      // the exec; a second throw here would race that answer.
+      const pending = state.pendingExecs.some((entry) => entry.execMsgId === exec.id);
+      if (!pending) {
+        for (const frame of unavailableExec(exec.id, `handler failed: ${message}`)) {
+          sendFrame(frameConnectMessage(frame));
+        }
+      }
+    } else if (msgCase === "interactionQuery") {
+      const query = msg.message.value as InteractionQuery;
+      const pending = state.pendingExecs.some(
+        (entry) => entry.interaction?.id === query.id,
+      );
+      if (!pending) {
+        sendFrame(frameConnectMessage(buildEmptyInteractionResponse(query.id)));
+      }
     }
   }
 }
@@ -1534,7 +1606,8 @@ export function removePendingExec(
 ): boolean {
   const index = pendingExecs.findIndex((exec) => exec.execMsgId === execMsgId);
   if (index === -1) return false;
-  pendingExecs.splice(index, 1);
+  const [removed] = pendingExecs.splice(index, 1);
+  if (removed?.heartbeatTimer) clearInterval(removed.heartbeatTimer);
   return true;
 }
 
@@ -1590,13 +1663,18 @@ function handleInteractionQuery(
     sendFrame(frameConnectMessage(response));
     return;
   }
-  proxyLog(`unsupported interaction query: ${queryCase ?? "none"}`);
+  // A query this schema cannot name (newer Cursor features) must still get a
+  // response on the open run, or the model waits forever. An id-only
+  // InteractionResponse is the safe answer.
+  sendFrame(frameConnectMessage(buildEmptyInteractionResponse(query.id)));
+  proxyLog(`unsupported interaction query ${queryCase ?? "none"} answered empty`);
 }
 
 function handleInteractionUpdate(
   update: any,
   state: StreamState,
   onText: (text: string, isThinking?: boolean) => void,
+  onTurnEnded?: () => void,
 ): void {
   const updateCase = update.message?.case;
 
@@ -1608,6 +1686,11 @@ function handleInteractionUpdate(
     if (delta) onText(delta, true);
   } else if (updateCase === "tokenDelta") {
     state.outputTokens += update.message.value.tokens ?? 0;
+  } else if (updateCase === "turnEnded") {
+    // The server declared the turn complete. Some servers keep the HTTP/2
+    // stream open after this, so terminate the SSE here instead of waiting
+    // for a close that may never come.
+    onTurnEnded?.();
   }
   // toolCallStarted, partialToolCall, toolCallDelta, toolCallCompleted
   // are intentionally ignored. MCP tool calls flow through the exec
@@ -1661,6 +1744,10 @@ function handleKvMessage(
       create(SetBlobResultSchema, {}),
       sendFrame,
     );
+  } else {
+    // An unnamed KV op leaves Cursor waiting if it expects a reply; at least
+    // make it visible instead of silently dropping the message.
+    proxyLog(`kv message ignored case=${kvCase ?? "none"}`);
   }
 }
 
@@ -1792,16 +1879,23 @@ function handleExecMessage(
   }
   if (execCase === "shellArgs" || execCase === "shellStreamArgs") {
     const args = effective.message.value;
+    const rejected = create(ShellRejectedSchema, {
+      command: args.command ?? "",
+      workingDirectory: args.workingDirectory ?? "",
+      reason: REJECT_REASON,
+      isReadonly: false,
+    });
+    if (execCase === "shellStreamArgs") {
+      // Cursor asked on the streaming shell field, so the rejection has to
+      // come back on that same field; a shellResult leaves the caller waiting.
+      const result = create(ShellStreamSchema, {
+        event: { case: "rejected", value: rejected },
+      });
+      sendExecResult(execMsg, "shellStream", result, sendFrame);
+      return;
+    }
     const result = create(ShellResultSchema, {
-      result: {
-        case: "rejected",
-        value: create(ShellRejectedSchema, {
-          command: args.command ?? "",
-          workingDirectory: args.workingDirectory ?? "",
-          reason: REJECT_REASON,
-          isReadonly: false,
-        }),
-      },
+      result: { case: "rejected", value: rejected },
     });
     sendExecResult(execMsg, "shellResult", result, sendFrame);
     return;
@@ -1838,21 +1932,73 @@ function handleExecMessage(
     return;
   }
   if (execCase === "diagnosticsArgs") {
-    const result = create(DiagnosticsResultSchema, {});
+    const args = effective.message.value;
+    // An empty success is a real "no diagnostics" answer; a bare
+    // DiagnosticsResult (no oneof case) reads as an unknown result.
+    const result = create(DiagnosticsResultSchema, {
+      result: {
+        case: "success",
+        value: create(DiagnosticsSuccessSchema, {
+          path: args.path ?? "",
+          diagnostics: [],
+          totalDiagnostics: 0,
+        }),
+      },
+    });
     sendExecResult(execMsg, "diagnosticsResult", result, sendFrame);
     return;
   }
 
-  // MCP resource/screen/computer exec types
-  const miscCaseMap: Record<string, string> = {
-    listMcpResourcesExecArgs: "listMcpResourcesExecResult",
-    readMcpResourceExecArgs: "readMcpResourceExecResult",
-    recordScreenArgs: "recordScreenResult",
-    computerUseArgs: "computerUseResult",
-  };
-  const resultCase = miscCaseMap[execCase as string];
-  if (resultCase) {
-    sendExecResult(execMsg, resultCase, create(McpResultSchema, {}), sendFrame);
+  // MCP resource/screen/computer exec types. Each has its own result type, so
+  // a generic McpResult leaves Cursor unable to decode the answer.
+  if (execCase === "listMcpResourcesExecArgs") {
+    const result = create(ListMcpResourcesExecResultSchema, {
+      result: {
+        case: "success",
+        value: create(ListMcpResourcesSuccessSchema, { resources: [] }),
+      },
+    });
+    sendExecResult(execMsg, "listMcpResourcesExecResult", result, sendFrame);
+    return;
+  }
+  if (execCase === "readMcpResourceExecArgs") {
+    const args = effective.message.value;
+    const result = create(ReadMcpResourceExecResultSchema, {
+      result: {
+        case: "error",
+        value: create(ReadMcpResourceErrorSchema, {
+          uri: args.uri ?? "",
+          error: "Reading MCP resources is not available in this environment.",
+        }),
+      },
+    });
+    sendExecResult(execMsg, "readMcpResourceExecResult", result, sendFrame);
+    return;
+  }
+  if (execCase === "recordScreenArgs") {
+    const result = create(RecordScreenResultSchema, {
+      result: {
+        case: "failure",
+        value: create(RecordScreenFailureSchema, {
+          error: "Screen recording is not available in this environment.",
+        }),
+      },
+    });
+    sendExecResult(execMsg, "recordScreenResult", result, sendFrame);
+    return;
+  }
+  if (execCase === "computerUseArgs") {
+    const result = create(ComputerUseResultSchema, {
+      result: {
+        case: "error",
+        value: create(ComputerUseErrorSchema, {
+          error: "Computer use is not available in this environment.",
+          actionCount: 0,
+          durationMs: 0,
+        }),
+      },
+    });
+    sendExecResult(execMsg, "computerUseResult", result, sendFrame);
     return;
   }
 
@@ -1921,6 +2067,7 @@ function createBridgeStreamResponse(
   // source so both the stream's cancel() and every exit path can run the same
   // shutdown exactly once.
   let keepaliveTimer: NodeJS.Timeout | undefined;
+  let turnEndTimer: NodeJS.Timeout | undefined;
   let shutdown: () => void = () => {};
 
   const stream = new ReadableStream({
@@ -1972,11 +2119,16 @@ function createBridgeStreamResponse(
        */
       shutdown = () => {
         stopKeepalive();
+        if (turnEndTimer !== undefined) {
+          clearTimeout(turnEndTimer);
+          turnEndTimer = undefined;
+        }
         if (pausedForToolResult) {
           // Parked bridge: keep the heartbeat and the activeBridges entry so
           // the tool-result request can resume this same stream.
           return;
         }
+        clearPendingExecTimers(state.pendingExecs);
         clearInterval(heartbeatTimer);
         if (activeBridges.get(bridgeKey)?.bridge === bridge) {
           activeBridges.delete(bridgeKey);
@@ -2027,6 +2179,28 @@ function createBridgeStreamResponse(
 
       let mcpExecReceived = false;
 
+      /** Close the turn without tearing the bridge down immediately. */
+      const finishTurn = () => {
+        if (pausedForToolResult) return;
+        const flushed = tagFilter.flush();
+        if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
+        if (flushed.content) sendSSE(makeChunk({ content: flushed.content }));
+        sendSSE(makeChunk({}, "stop"));
+        sendSSE(makeUsageChunk());
+        sendDone();
+        closeController();
+        // Let the server send a final checkpoint or end-stream before the
+        // bridge is reaped. The SSE is already complete, so the caller is not
+        // waiting on this grace period.
+        if (turnEndTimer === undefined) {
+          turnEndTimer = setTimeout(() => {
+            turnEndTimer = undefined;
+            shutdown();
+          }, 5_000);
+          turnEndTimer.unref?.();
+        }
+      };
+
       const processChunk = createConnectFrameParser(
         (messageBytes) => {
           try {
@@ -2054,6 +2228,16 @@ function createBridgeStreamResponse(
               (exec) => {
                 state.pendingExecs.push(exec);
                 mcpExecReceived = true;
+
+                // Cursor's exec handler expects a heartbeat every few seconds
+                // while a tool is outstanding; the agent-level heartbeat alone
+                // does not cover a long bash/grep run.
+                if (exec.execMsgId !== 0 && !exec.heartbeatTimer) {
+                  exec.heartbeatTimer = setInterval(() => {
+                    bridge.write(frameConnectMessage(makeExecHeartbeat(exec.execMsgId)));
+                  }, EXEC_HEARTBEAT_MS);
+                  exec.heartbeatTimer.unref?.();
+                }
 
                 const flushed = tagFilter.flush();
                 if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
@@ -2092,6 +2276,9 @@ function createBridgeStreamResponse(
                 closeController();
                 stopKeepalive();
               },
+              // onTurnEnded — the server declared the turn complete. Close the
+              // SSE even if it keeps the HTTP/2 stream open.
+              finishTurn,
               (checkpointBytes) => {
                 const stored = conversationStates.get(convKey);
                 if (stored) {
@@ -2109,6 +2296,10 @@ function createBridgeStreamResponse(
           }
         },
         (endStreamBytes) => {
+          if (endStreamBytes.length === 0) {
+            finishTurn();
+            return;
+          }
           const endError = parseConnectEndStream(endStreamBytes);
           if (process.env.CURSOR_PROXY_DEBUG) {
             console.error(`[proxy] endStream: ${endError ? endError.message : "clean"}`);
@@ -2135,6 +2326,7 @@ function createBridgeStreamResponse(
         // here rather than in shutdown(), which deliberately leaves the paused
         // bridge's interval alone.
         clearInterval(heartbeatTimer);
+        clearPendingExecTimers(state.pendingExecs);
         const stored = conversationStates.get(convKey);
         if (stored) {
           for (const [k, v] of blobStore) stored.blobStore.set(k, v);
@@ -2223,6 +2415,7 @@ export interface AnsweredExec {
   toolCallId: string;
   native?: NativeExecBinding;
   interaction?: AskQuestionInteraction;
+  heartbeatTimer?: NodeJS.Timeout;
 }
 
 /**
@@ -2236,25 +2429,30 @@ export function answerPendingExecs(
   userText: string,
   write: (frame: Uint8Array) => void,
 ): void {
-  const lastExecId = pendingExecs[pendingExecs.length - 1]?.execId;
-  for (const exec of pendingExecs) {
+  for (const [index, exec] of pendingExecs.entries()) {
+    if (exec.heartbeatTimer) {
+      clearInterval(exec.heartbeatTimer);
+      exec.heartbeatTimer = undefined;
+    }
     const result = toolResults.find(
       (r) => r.toolCallId === exec.toolCallId,
     );
+    const baseText = result ? result.content : "Tool result not provided";
     // A user message sent alongside tool results (e.g. the explanation typed
-    // after rejecting an edit) would otherwise be dropped: the paused bridge
-    // only accepts tool results. Attach it to the last result so the model
-    // sees it (issue #23).
-    let text = result ? result.content : "Tool result not provided";
-    if (userText && exec.execId === lastExecId) {
-      text += `\n\n<user_message>\n${userText}\n</user_message>`;
-    }
+    // after rejecting an edit) would otherwise be dropped. Attach it only to
+    // an MCP result: the array position is the reliable "last" marker because
+    // `execId` is empty for most execs. Native typed results have no field for
+    // it, and appending it to their content would corrupt file/shell output.
+    const withUser = () =>
+      userText && index === pendingExecs.length - 1
+        ? `${baseText}\n\n<user_message>\n${userText}\n</user_message>`
+        : baseText;
 
     // AskQuestion was bridged to maki's `question` tool. The upstream is
     // waiting on an InteractionResponse, not an exec result, so answer the
     // interaction and let the same bridge continue.
     if (exec.interaction) {
-      const answer = buildAskQuestionResult(exec.interaction.args, text);
+      const answer = buildAskQuestionResult(exec.interaction.args, baseText);
       proxyLog(
         `askQuestion answered id=${exec.interaction.id} result=${answer.result.case ?? "none"}`,
       );
@@ -2265,7 +2463,7 @@ export function answerPendingExecs(
     }
 
     if (result && exec.native) {
-      const sent = sendNativeExecResult(exec, exec.native, text, (bytes) =>
+      const sent = sendNativeExecResult(exec, exec.native, baseText, (bytes) =>
         write(frameConnectMessage(bytes)),
       );
       if (sent) {
@@ -2274,7 +2472,15 @@ export function answerPendingExecs(
       }
     }
 
-    const mcpResult = result
+    const text = withUser();
+
+    // maki reports tool failure as text. Passing it as a success makes the
+    // model try to use an error string as if it were output; surface it as an
+    // MCP error result instead.
+    const toolFailed =
+      result !== undefined &&
+      (/^error[:\s]/i.test(text) || text.startsWith("Permission denied"));
+    const mcpResult = result && !toolFailed
       ? create(McpResultSchema, {
           result: {
             case: "success",
@@ -2353,15 +2559,17 @@ function handleNonStreamingResponse(
   const stream = new ReadableStream({
     async start(controller) {
       try {
-        const { text, usage, exitCode } = await collectFullResponse(
+        const { text, usage, exitCode, errorDetail } = await collectFullResponse(
           payload,
           accessToken,
           convKey,
           abort.signal,
         );
         const failed = exitCode !== 0;
+        const detail = errorDetail?.trim() ? `: ${errorDetail.trim()}` : "";
+        const failure = `cursor bridge exited (${exitCode})${detail}`;
         const message = failed
-          ? { role: "assistant", content: `\n[Error: cursor bridge exited (${exitCode})]` }
+          ? { role: "assistant", content: `\n[Error: ${failure}]` }
           : { role: "assistant", content: text };
         const payloadBody: Record<string, unknown> = {
           id: completionId,
@@ -2379,7 +2587,7 @@ function handleNonStreamingResponse(
         };
         if (failed) {
           payloadBody.error = {
-            message: `cursor bridge exited (${exitCode})`,
+            message: failure,
             type: "upstream_error",
           };
         }
@@ -2403,6 +2611,8 @@ interface CollectedResponse {
   text: string;
   usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
   exitCode: number;
+  /** Server error or bridge stderr tail, for the non-streaming error body. */
+  errorDetail?: string;
 }
 
 async function collectFullResponse(
@@ -2434,6 +2644,10 @@ async function collectFullResponse(
     totalTokens: 0,
   };
   const tagFilter = createThinkingTagFilter();
+  // Connect's end-stream frame carries a server error after the last message.
+  // Without recording it, a failed run looked like a clean "stop" with
+  // whatever text had streamed so far.
+  let endError: Error | null = null;
 
   bridge.onData(createConnectFrameParser(
     (messageBytes) => {
@@ -2481,6 +2695,12 @@ async function collectFullResponse(
               }
             }
           },
+          () => {
+            // Non-streaming: the server said the turn is done. Reap the
+            // bridge so the request settles even if the stream stays open.
+            clearInterval(heartbeatTimer);
+            closeBridgeGracefully(bridge);
+          },
           (checkpointBytes) => {
             const stored = conversationStates.get(convKey);
             if (stored) {
@@ -2495,7 +2715,23 @@ async function collectFullResponse(
         // Skip
       }
     },
-    () => {},
+    (endStreamBytes) => {
+      // A zero-length end-stream frame carries no JSON; treat it as a clean
+      // end rather than a parse failure.
+      if (endStreamBytes.length === 0) {
+        clearInterval(heartbeatTimer);
+        closeBridgeGracefully(bridge);
+        return;
+      }
+      const error = parseConnectEndStream(endStreamBytes);
+      if (!error) return;
+      endError = error;
+      proxyLog(`cursor end stream error: ${error.message}`);
+      // The server is done with this run; reap the bridge so onClose settles
+      // now instead of waiting for the child to notice the stream end.
+      clearInterval(heartbeatTimer);
+      closeBridgeGracefully(bridge);
+    },
   ));
 
   bridge.onClose((code) => {
@@ -2514,7 +2750,10 @@ async function collectFullResponse(
     resolve({
       text: fullText,
       usage,
-      exitCode: code,
+      // A server-reported end-stream error is a failed turn even when the
+      // process exited cleanly.
+      exitCode: endError ? 1 : code,
+      errorDetail: endError?.message ?? bridge.stderrTail(),
     });
   });
 

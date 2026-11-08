@@ -14,6 +14,7 @@ import { lengthDelimited } from "./proto-wire.ts";
 import {
   AgentClientMessageSchema,
   ExecClientMessageSchema,
+  FetchErrorSchema,
   FetchResultSchema,
   FetchSuccessSchema,
   GrepContentMatchSchema,
@@ -27,8 +28,11 @@ import {
   GrepUnionResultSchema,
   LsDirectoryTreeNodeSchema,
   LsDirectoryTreeNode_FileSchema,
+  LsErrorSchema,
   LsResultSchema,
   LsSuccessSchema,
+  ReadErrorSchema,
+  ReadPermissionDeniedSchema,
   ReadResultSchema,
   ReadSuccessSchema,
   ShellFailureSchema,
@@ -39,6 +43,7 @@ import {
   ShellStreamStartSchema,
   ShellStreamStdoutSchema,
   ShellSuccessSchema,
+  WriteErrorSchema,
   WritePermissionDeniedSchema,
   WriteResultSchema,
   WriteSuccessSchema,
@@ -90,7 +95,7 @@ function bindingFor(execCase: string, args: NativeCall["value"]): NativeExecBind
       args: {
         path: args.path ?? "",
         fileSize: String(new TextEncoder().encode(content).byteLength),
-        linesCreated: String(content.split("\n").length),
+        linesCreated: String(content === "" ? 0 : content.replace(/\n$/, "").split("\n").length),
       },
     };
   }
@@ -190,21 +195,7 @@ export function sendNativeExecResult(
 
   switch (binding.resultType) {
     case "readResult": {
-      sendExec(
-        "readResult",
-        create(ReadResultSchema, {
-          result: {
-            case: "success",
-            value: create(ReadSuccessSchema, {
-              path: args.path ?? "",
-              totalLines: text.split("\n").length,
-              fileSize: BigInt(new TextEncoder().encode(text).byteLength),
-              truncated: false,
-              output: { case: "content", value: text },
-            }),
-          },
-        }),
-      );
+      sendExec("readResult", readResult(args, text));
       return true;
     }
 
@@ -241,19 +232,7 @@ export function sendNativeExecResult(
     }
 
     case "fetchResult": {
-      sendExec(
-        "fetchResult",
-        create(FetchResultSchema, {
-          result: {
-            case: "success",
-            value: create(FetchSuccessSchema, {
-              url: args.url ?? "",
-              content: text,
-              statusCode: 200,
-            }),
-          },
-        }),
-      );
+      sendExec("fetchResult", fetchResult(args, text));
       return true;
     }
 
@@ -279,13 +258,124 @@ function isDenied(text: string): boolean {
   return text.startsWith(PERMISSION_DENIED);
 }
 
-/** bash puts a non-zero status on its own line. A clean command has no such line. */
-function shellOutcome(text: string): { stdout: string; exitCode: number } {
-  const lined = text.match(/^(.*)\nExit code: (\d+)$/s);
-  if (lined) return { stdout: lined[1], exitCode: Number(lined[2]) };
-  const only = text.match(/^Exit code: (\d+)$/);
-  if (only) return { stdout: "", exitCode: Number(only[1]) };
-  return { stdout: text, exitCode: 0 };
+/** maki emits these marker lines in place of (or after) real output. */
+function isOutputSentinel(line: string): boolean {
+  return (
+    line === "No files found" ||
+    line.startsWith("[truncated ") ||
+    line.startsWith("[output passed the")
+  );
+}
+
+/**
+ * bash appends `Exit code: N` on failure, then `Full output: <path>` when it
+ * kept a log. Success with output has no exit line at all.
+ */
+export function shellOutcome(text: string): { stdout: string; exitCode: number } {
+  const lines = text.split("\n").map((line) => line.replace(/\r$/, ""));
+  // maki may append a log pointer and/or truncation markers after the status.
+  while (
+    lines.length > 0 &&
+    /^(?:Full output: |\[truncated |\[output passed the )/.test(lines[lines.length - 1]!)
+  ) {
+    lines.pop();
+  }
+  const last = lines.at(-1);
+  const exit = last?.match(/^Exit code: (\d+)$/);
+  if (exit) {
+    return { stdout: lines.slice(0, -1).join("\n"), exitCode: Number(exit[1]) };
+  }
+  return { stdout: lines.join("\n"), exitCode: 0 };
+}
+
+/** maki's read output is line-numbered; Cursor wants the raw file text. */
+function normalizeReadOutput(text: string): {
+  content: string;
+  totalLines: number;
+  truncated: boolean;
+} {
+  const lines = text.split("\n");
+  const isHint = (line: string) =>
+    line === "" || line === "..." || /^Truncated lines: \d+-\d+\./.test(line);
+  const numbered = lines
+    .filter((line) => line !== "")
+    .every((line) => isHint(line) || /^\s*\d+: ?/.test(line));
+  if (!numbered) {
+    return { content: text, totalLines: lines.length, truncated: false };
+  }
+
+  const out: string[] = [];
+  let totalLines = 0;
+  let truncated = false;
+  for (const line of lines) {
+    const hint = line.match(/^Truncated lines: (\d+)-(\d+)\./);
+    if (hint) {
+      truncated = true;
+      totalLines = Math.max(totalLines, Number(hint[2]));
+      continue;
+    }
+    if (line === "..." || line === "") continue;
+    const match = line.match(/^\s*(\d+): ?(.*)$/);
+    if (!match) {
+      out.push(line);
+      continue;
+    }
+    totalLines = Math.max(totalLines, Number(match[1]));
+    out.push(match[2]!);
+  }
+  while (out.length > 0 && out[out.length - 1] === "") out.pop();
+  return { content: out.join("\n"), totalLines: totalLines || out.length, truncated };
+}
+
+export function readResult(args: Record<string, string>, text: string) {
+  const path = args.path ?? "";
+  if (/permission denied/i.test(text.split("\n")[0]!)) {
+    return create(ReadResultSchema, {
+      result: {
+        case: "permissionDenied",
+        value: create(ReadPermissionDeniedSchema, { path }),
+      },
+    });
+  }
+  if (/^(?:read error|error):/i.test(text)) {
+    return create(ReadResultSchema, {
+      result: {
+        case: "error",
+        value: create(ReadErrorSchema, { path, error: text }),
+      },
+    });
+  }
+  const normalized = normalizeReadOutput(text);
+  return create(ReadResultSchema, {
+    result: {
+      case: "success",
+      value: create(ReadSuccessSchema, {
+        path,
+        totalLines: normalized.totalLines,
+        fileSize: BigInt(new TextEncoder().encode(normalized.content).byteLength),
+        truncated: normalized.truncated,
+        output: { case: "content", value: normalized.content },
+      }),
+    },
+  });
+}
+
+function fetchResult(args: Record<string, string>, text: string) {
+  const url = args.url ?? "";
+  if (text.startsWith("error:")) {
+    return create(FetchResultSchema, {
+      result: {
+        case: "error",
+        value: create(FetchErrorSchema, { url, error: text }),
+      },
+    });
+  }
+  return create(FetchResultSchema, {
+    result: {
+      case: "success",
+      value: create(FetchSuccessSchema, { url, content: text, statusCode: 200 }),
+    },
+  });
 }
 
 function writeResult(args: Record<string, string>, text: string) {
@@ -300,6 +390,14 @@ function writeResult(args: Record<string, string>, text: string) {
           error: text,
           isReadonly: false,
         }),
+      },
+    });
+  }
+  if (/^(?:write error:|error:)/.test(text)) {
+    return create(WriteResultSchema, {
+      result: {
+        case: "error",
+        value: create(WriteErrorSchema, { path: args.path ?? "", error: text }),
       },
     });
   }
@@ -424,10 +522,18 @@ function sendShellStream(
  */
 export function buildLsResult(content: string, rootPath: string) {
   const normalizedRoot = cleanLsPath(rootPath);
+  if (/^(?:error:|permission denied)/i.test(content.trim())) {
+    return create(LsResultSchema, {
+      result: {
+        case: "error",
+        value: create(LsErrorSchema, { path: normalizedRoot, error: content.trim() }),
+      },
+    });
+  }
   const rawLines = content
     .split("\n")
     .map((line) => line.trim())
-    .filter(Boolean);
+    .filter((line) => line && !isOutputSentinel(line));
 
   const root = create(LsDirectoryTreeNodeSchema, {
     absPath: normalizedRoot,
@@ -518,11 +624,20 @@ function indexOfSegments(haystack: string[], needle: string[]): number {
  * Path of `file` below the requested root, or null when it is outside it.
  * Handles all four absolute/relative combinations.
  */
-function relativeToRoot(file: string, root: string): string | null {
-  const cleaned = cleanLsPath(file);
-  if (cleaned === "." || cleaned === root) return null;
+function expandHome(path: string): string {
+  const cleaned = cleanLsPath(path);
+  if (cleaned !== "~" && !cleaned.startsWith("~/")) return cleaned;
+  const home = process.env.HOME;
+  if (!home) return cleaned;
+  return cleanLsPath(`${home}${cleaned.slice(1)}`);
+}
 
-  if (root === ".") {
+function relativeToRoot(file: string, root: string): string | null {
+  const cleaned = expandHome(file);
+  const rootPath = expandHome(root);
+  if (cleaned === "." || cleaned === rootPath) return null;
+
+  if (rootPath === ".") {
     // Everything the root's glob returned is below it. An absolute path is
     // resolved against the process cwd, which is the directory maki searched.
     if (!cleaned.startsWith("/")) return cleaned;
@@ -534,9 +649,9 @@ function relativeToRoot(file: string, root: string): string | null {
     return cleaned.slice(1);
   }
 
-  if (cleaned.startsWith(`${root}/`)) return cleaned.slice(root.length + 1);
+  if (cleaned.startsWith(`${rootPath}/`)) return cleaned.slice(rootPath.length + 1);
 
-  const rootSegments = splitSegments(root);
+  const rootSegments = splitSegments(rootPath);
   const fileSegments = splitSegments(cleaned);
 
   // Absolute root + relative file: the root's trailing segments prefix the file.
@@ -592,7 +707,7 @@ function computeLsStats(node: LsDirectoryTreeNode): void {
 }
 
 /** Parse the client grep tool's text output back into Cursor's structured result. */
-function buildGrepResult(content: string, args: Record<string, string>) {
+export function buildGrepResult(content: string, args: Record<string, string>) {
   const pattern = args.pattern ?? "";
   const path = args.path ?? "";
   const outputMode = args.outputMode || "content";
@@ -602,12 +717,15 @@ function buildGrepResult(content: string, args: Record<string, string>) {
     return null;
   }
 
+  const headLimit = Number(args.headLimit ?? 0);
+  const truncatedByOutput = /(^|\n)\[(?:truncated |output passed the )/.test(content);
+  const clientTruncated = (Number.isFinite(headLimit) && headLimit > 0) || truncatedByOutput;
   const unionResult =
     outputMode === "count"
-      ? buildGrepCountResult(content, Boolean(args.headLimit))
+      ? buildGrepCountResult(content, clientTruncated)
       : outputMode === "files_with_matches"
-        ? buildGrepFilesResult(content, Boolean(args.headLimit))
-        : buildGrepContentResult(content, Boolean(args.headLimit));
+        ? buildGrepFilesResult(content, clientTruncated)
+        : buildGrepContentResult(content, clientTruncated);
 
   // Non-empty tool output that we failed to parse: better to hand the raw
   // text back as an mcpResult than to claim "no matches".
@@ -697,7 +815,7 @@ export function buildGrepFilesResult(content: string, clientTruncated: boolean) 
     // maki's glob output: one file path per line.
     for (const rawLine of content.split("\n")) {
       const line = rawLine.replace(/\r$/, "").trim();
-      if (line) files.push(line);
+      if (line && !isOutputSentinel(line)) files.push(line);
     }
   }
 
