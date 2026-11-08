@@ -92,6 +92,7 @@ import {
 import { spawn, type ChildProcess } from "node:child_process";
 import http from "node:http";
 import { createHash } from "node:crypto";
+import { gunzipSync } from "node:zlib";
 import { chmod, mkdir, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
 import { resolve as pathResolve } from "node:path";
 import { z } from "zod";
@@ -115,6 +116,7 @@ import { proxyLog } from "./log.ts";
 
 const CURSOR_API_URL = process.env.CURSOR_API_URL ?? "https://api2.cursor.sh";
 const CONNECT_END_STREAM_FLAG = 0b00000010;
+const CONNECT_COMPRESSED_FLAG = 0b00000001;
 const BRIDGE_PATH = pathResolve(import.meta.dirname, "h2-bridge.mjs");
 const SSE_HEADERS = {
   "Content-Type": "text/event-stream",
@@ -193,6 +195,8 @@ interface ActiveBridge {
   mcpTools: McpToolDefinition[];
   cloudRule?: string;
   pendingExecs: PendingExec[];
+  /** Detaches the previous response's close handler when resumed. */
+  detachClose?: () => void;
   /** When the bridge was paused for a tool result; used for TTL eviction. */
   createdAt: number;
 }
@@ -278,6 +282,7 @@ const STREAM_STALL_TIMEOUT_MS = (() => {
 
 /** A Connect message larger than this cannot be a real model frame. */
 const MAX_CONNECT_FRAME_BYTES = 64 * 1024 * 1024;
+const MAX_BRIDGE_MESSAGE_BYTES = MAX_CONNECT_FRAME_BYTES + 1024;
 
 interface StoredConversation {
   conversationId: string;
@@ -462,12 +467,22 @@ interface SpawnBridgeOptions {
 /** How much bridge stderr to keep for diagnostics. */
 const BRIDGE_STDERR_BYTES = 4 * 1024;
 
+type FrameSink = {
+  onMessage(bytes: Uint8Array): void;
+  onEndStream(bytes: Uint8Array): void;
+  onProtocolError(message: string): void;
+  isClosed(): boolean;
+};
+
 type Bridge = {
   proc: ChildProcess;
   write: (data: Uint8Array) => void;
   end: () => void;
   onData: (cb: (chunk: Buffer) => void) => void;
-  onClose: (cb: (code: number) => void) => void;
+  /** Attach the current response's message sink to the bridge-wide decoder. */
+  attachSink: (sink: FrameSink) => void;
+  detachSink: () => void;
+  onClose: (cb: (code: number) => void) => () => void;
   /** Last few KB the bridge wrote to stderr, for error reporting. */
   stderrTail: () => string;
   /** Terminate the subprocess; safe to call more than once. */
@@ -535,24 +550,60 @@ function spawnBridge(options: SpawnBridgeOptions): Bridge {
   });
   stdin.write(lpEncode(new TextEncoder().encode(config)));
 
+  const framed = !(options.unary ?? false);
   const cbs = {
     data: null as ((chunk: Buffer) => void) | null,
-    close: null as ((code: number) => void) | null,
   };
+  const closeHandlers = new Set<(code: number) => void>();
   const early: Buffer[] = [];
 
   let exited = false;
   let exitCode = 1;
   let pending = Buffer.alloc(0);
+  let sink: FrameSink | null = null;
+  let protocolFailure: string | null = null;
+  let oversized = false;
+
+  // One decoder per bridge: the upstream byte stream outlives any single SSE
+  // response, so a resume must not lose a partially received frame.
+  const decoder = framed
+    ? createConnectFrameParser(
+        (bytes) => { if (sink) sink.onMessage(bytes); },
+        (bytes) => { if (sink) sink.onEndStream(bytes); },
+        (message) => {
+          // A live response handles its own error; only a failure that lands
+          // with no sink is latched for the response that attaches next.
+          if (sink) {
+            sink.onProtocolError(message);
+          } else {
+            protocolFailure = message;
+            proxyLog(`cursor protocol error: ${message}`);
+          }
+        },
+      )
+    : null;
 
   const takeFrames = (value: Buffer) => {
+    if (oversized) return;
     pending = Buffer.concat([pending, value]);
     while (pending.length >= 4) {
       const len = pending.readUInt32BE(0);
+      if (len > MAX_BRIDGE_MESSAGE_BYTES) {
+        oversized = true;
+        pending = Buffer.alloc(0);
+        proxyLog(`bridge pid ${proc.pid ?? "?"} oversized stdout message (${len} bytes)`);
+        try {
+          proc.kill();
+        } catch {
+          // Already reaped.
+        }
+        return;
+      }
       if (pending.length < 4 + len) break;
       const payload = Buffer.from(pending.subarray(4, 4 + len));
       pending = pending.subarray(4 + len);
-      if (cbs.data) cbs.data(payload);
+      if (decoder) decoder.push(payload);
+      else if (cbs.data) cbs.data(payload);
       else early.push(payload);
     }
   };
@@ -598,12 +649,33 @@ function spawnBridge(options: SpawnBridgeOptions): Bridge {
       for (const chunk of early) cb(chunk);
       early.length = 0;
     },
+    attachSink(next) {
+      // Replacing a parked (already closed) sink is the normal resume path;
+      // only a live replacement is suspicious enough to log.
+      if (sink && !sink.isClosed()) {
+        proxyLog(
+          `bridge pid ${proc.pid ?? "?"} sink replaced while live pending=${decoder?.pendingLength() ?? 0}`,
+        );
+      }
+      sink = next;
+      if (protocolFailure) {
+        const failure = protocolFailure;
+        protocolFailure = null;
+        next.onProtocolError(failure);
+      }
+    },
+    detachSink() {
+      sink = null;
+    },
     onClose(cb) {
       if (exited) {
         queueMicrotask(() => cb(exitCode));
-      } else {
-        cbs.close = cb;
+        return () => {};
       }
+      closeHandlers.add(cb);
+      return () => {
+        closeHandlers.delete(cb);
+      };
     },
   };
 
@@ -622,7 +694,9 @@ function spawnBridge(options: SpawnBridgeOptions): Bridge {
         `bridge pid ${proc.pid ?? "?"} exited ${code}${tail ? `: ${tail}` : ""}`,
       );
     }
-    cbs.close?.(code);
+    const handlers = [...closeHandlers];
+    closeHandlers.clear();
+    for (const cb of handlers) cb(code);
   };
   proc.on("exit", (code) => finish(code ?? 1));
   proc.on("error", (err) => {
@@ -1435,6 +1509,13 @@ function makeHeartbeatBytes(): Uint8Array {
   return frameConnectMessage(toBinary(AgentClientMessageSchema, heartbeat));
 }
 
+interface ConnectFrameParser {
+  push(incoming: Buffer): void;
+  pendingLength(): number;
+  consumedBytes(): number;
+  failed(): boolean;
+}
+
 /**
  * Create a stateful parser for Connect protocol frames.
  * Handles buffering partial data across chunks.
@@ -1449,18 +1530,21 @@ function createConnectFrameParser(
   onMessage: (bytes: Uint8Array) => void,
   onEndStream: (bytes: Uint8Array) => void,
   onProtocolError?: (message: string) => void,
-): (incoming: Buffer) => void {
+): ConnectFrameParser {
   let pending = Buffer.alloc(0);
   let failed = false;
+  let consumed = 0;
   const fail = (why: string) => {
     if (failed) return;
     failed = true;
     const body = pending.subarray(0, 400).toString("utf8").replace(/\s+/g, " ").trim();
+    const detail = `${why} [consumed=${consumed} pending=${pending.length}]`;
     pending = Buffer.alloc(0);
-    onProtocolError?.(body ? `${why}: ${body}` : why);
+    onProtocolError?.(body ? `${detail}: ${body}` : detail);
   };
-  return (incoming: Buffer) => {
+  const push = (incoming: Buffer) => {
     if (failed) return;
+    consumed += incoming.length;
     pending = Buffer.concat([pending, incoming]);
     while (pending.length >= 5) {
       const flags = pending[0]!;
@@ -1476,14 +1560,33 @@ function createConnectFrameParser(
         return;
       }
       if (pending.length < 5 + msgLen) break;
-      const messageBytes = pending.subarray(5, 5 + msgLen);
+      let messageBytes: Uint8Array = pending.subarray(5, 5 + msgLen);
       pending = pending.subarray(5 + msgLen);
+      if (flags & CONNECT_COMPRESSED_FLAG) {
+        try {
+          messageBytes = gunzipSync(messageBytes, {
+            maxOutputLength: MAX_CONNECT_FRAME_BYTES,
+          });
+        } catch (err) {
+          fail(
+            "compressed Connect frame could not be decoded: " +
+              (err instanceof Error ? err.message : String(err)),
+          );
+          return;
+        }
+      }
       if (flags & CONNECT_END_STREAM_FLAG) {
         onEndStream(messageBytes);
       } else {
         onMessage(messageBytes);
       }
     }
+  };
+  return {
+    push,
+    pendingLength: () => pending.length,
+    consumedBytes: () => consumed,
+    failed: () => failed,
   };
 }
 
@@ -2137,6 +2240,7 @@ function createBridgeStreamResponse(
   let turnEndTimer: NodeJS.Timeout | undefined;
   let stallTimer: NodeJS.Timeout | undefined;
   let shutdown: () => void = () => {};
+  let offClose: () => void = () => {};
 
   const stream = new ReadableStream({
     cancel() {
@@ -2182,6 +2286,19 @@ function createBridgeStreamResponse(
       };
 
       /**
+       * Persist the conversation before the bridge is reaped. The close
+       * handler may no longer be registered at that point (shutdown detaches
+       * it), so the state has to be written here as well.
+       */
+      const persistNow = () => {
+        const stored = conversationStates.get(convKey);
+        if (!stored) return;
+        for (const [k, v] of blobStore) stored.blobStore.set(k, v);
+        stored.lastAccessMs = Date.now();
+        persistConversation(convKey, stored);
+      };
+
+      /**
        * The single teardown path. Every exit (clean end, end-stream error,
        * bridge exit, client abort) goes through here, so timers are cleared
        * and the controller closed at most once.
@@ -2205,6 +2322,9 @@ function createBridgeStreamResponse(
         }
         // The client is gone (or the turn is over); no one will read this
         // bridge again, so end it and reap the subprocess.
+        persistNow();
+        bridge.detachSink();
+        offClose();
         closeBridgeGracefully(bridge);
       };
 
@@ -2318,8 +2438,8 @@ function createBridgeStreamResponse(
         }
       };
 
-      const processChunk = createConnectFrameParser(
-        (messageBytes) => {
+      const frameSink: FrameSink = {
+        onMessage: (messageBytes) => {
           try {
             const serverMessage = fromBinary(
               AgentServerMessageSchema,
@@ -2386,6 +2506,7 @@ function createBridgeStreamResponse(
                   mcpTools,
                   cloudRule,
                   pendingExecs: state.pendingExecs,
+                  detachClose: offClose,
                   createdAt: Date.now(),
                 });
 
@@ -2414,9 +2535,15 @@ function createBridgeStreamResponse(
             // Skip unparseable messages
           }
         },
-        (endStreamBytes) => {
+        onEndStream: (endStreamBytes) => {
           noteProgress();
           if (endStreamBytes.length === 0) {
+            if (pausedForToolResult) {
+              proxyLog(`bridge ${bridgeKey} ended upstream while parked for a tool result`);
+              pausedForToolResult = false;
+              shutdown();
+              return;
+            }
             finishTurn();
             return;
           }
@@ -2429,19 +2556,43 @@ function createBridgeStreamResponse(
             // stream, and heartbeats would otherwise keep the bridge (and the
             // SSE response) open forever.
             proxyLog(`cursor end stream error: ${endError.message}`);
-            sendSSE(makeChunk({ content: `\n[Error: ${endError.message}]` }));
-            sendSSE(makeChunk({}, "stop"));
-            sendSSE(makeUsageChunk());
-            sendDone();
+            if (activeBridges.get(bridgeKey)?.bridge === bridge) {
+              activeBridges.delete(bridgeKey);
+            }
+            if (!closed) {
+              sendSSE(makeChunk({ content: `\n[Error: ${endError.message}]` }));
+              sendSSE(makeChunk({}, "stop"));
+              sendSSE(makeUsageChunk());
+              sendDone();
+            }
             closeController();
+            pausedForToolResult = false;
+            shutdown();
+            return;
+          }
+          if (pausedForToolResult) {
+            // The run is over, so the parked bridge can never be resumed.
+            proxyLog(`bridge ${bridgeKey} ended upstream while parked for a tool result`);
+            if (activeBridges.get(bridgeKey)?.bridge === bridge) {
+              activeBridges.delete(bridgeKey);
+            }
+            closeController();
+            pausedForToolResult = false;
             shutdown();
           }
         },
-        (protocolError) => {
+        onProtocolError: (protocolError) => {
           // A 200 response whose body is not Connect-framed (often an edge
           // proxy's JSON error) must become a visible failure, not silence.
           proxyLog(`cursor protocol error: ${protocolError}`);
-          if (closed) return;
+          if (activeBridges.get(bridgeKey)?.bridge === bridge) {
+            activeBridges.delete(bridgeKey);
+          }
+          if (closed) {
+            pausedForToolResult = false;
+            shutdown();
+            return;
+          }
           sendSSE(makeChunk({
             content: `\n[Error: cursor upstream sent an unframed response: ${protocolError}]`,
           }));
@@ -2449,24 +2600,21 @@ function createBridgeStreamResponse(
           sendSSE(makeUsageChunk());
           sendDone();
           closeController();
+          pausedForToolResult = false;
           shutdown();
         },
-      );
+        isClosed: () => closed,
+      };
 
-      bridge.onData(processChunk);
+      bridge.attachSink(frameSink);
 
-      bridge.onClose((code) => {
+      offClose = bridge.onClose((code) => {
         // The subprocess is gone, so its heartbeat has nowhere to go. Clear it
         // here rather than in shutdown(), which deliberately leaves the paused
         // bridge's interval alone.
         clearInterval(heartbeatTimer);
         clearPendingExecTimers(state.pendingExecs);
-        const stored = conversationStates.get(convKey);
-        if (stored) {
-          for (const [k, v] of blobStore) stored.blobStore.set(k, v);
-          stored.lastAccessMs = Date.now();
-          persistConversation(convKey, stored);
-        }
+        persistNow();
         // A clean exit can still happen while parked (upstream closed after
         // sending tool calls). Drop the entry here, unconditionally, so a dead
         // bridge never waits 30 minutes for TTL eviction.
@@ -2667,13 +2815,14 @@ function handleToolResultResume(
 ): Response {
   const { bridge, heartbeatTimer, blobStore, mcpTools, cloudRule, pendingExecs } = active;
 
-  answerPendingExecs(pendingExecs, toolResults, userText, (frame) => bridge.write(frame));
-
-  return createBridgeStreamResponse(
+  const response = createBridgeStreamResponse(
     bridge, heartbeatTimer,
     blobStore, mcpTools, cloudRule,
     modelId, bridgeKey, convKey,
   );
+  active.detachClose?.();
+  answerPendingExecs(pendingExecs, toolResults, userText, (frame) => bridge.write(frame));
+  return response;
 }
 
 function handleNonStreamingResponse(
@@ -2811,8 +2960,8 @@ async function collectFullResponse(
   };
   const tagFilter = createThinkingTagFilter();
 
-  bridge.onData(createConnectFrameParser(
-    (messageBytes) => {
+  bridge.attachSink({
+    onMessage: (messageBytes) => {
       try {
         const serverMessage = fromBinary(
           AgentServerMessageSchema,
@@ -2878,11 +3027,12 @@ async function collectFullResponse(
         // Skip
       }
     },
-    (endStreamBytes) => {
+    onEndStream: (endStreamBytes) => {
       noteProgress();
       // A zero-length end-stream frame carries no JSON; treat it as a clean
       // end rather than a parse failure.
       if (endStreamBytes.length === 0) {
+        stopStall();
         clearInterval(heartbeatTimer);
         closeBridgeGracefully(bridge);
         return;
@@ -2896,13 +3046,14 @@ async function collectFullResponse(
       clearInterval(heartbeatTimer);
       closeBridgeGracefully(bridge);
     },
-    (protocolError) => {
+    onProtocolError: (protocolError) => {
       endError = new Error(`unframed upstream response: ${protocolError}`);
       proxyLog(`cursor protocol error: ${endError.message}`);
       clearInterval(heartbeatTimer);
       closeBridgeGracefully(bridge);
     },
-  ));
+    isClosed: () => endError !== null,
+  });
   armStall();
 
   bridge.onClose((code) => {
