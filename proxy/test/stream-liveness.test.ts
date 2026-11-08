@@ -20,9 +20,15 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { after } from "node:test";
-import { create, toBinary } from "@bufbuild/protobuf";
+import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import {
+  AgentClientMessageSchema,
   AgentServerMessageSchema,
+  AskQuestionArgs_OptionSchema,
+  AskQuestionArgs_QuestionSchema,
+  AskQuestionArgsSchema,
+  AskQuestionInteractionQuerySchema,
+  InteractionQuerySchema,
   InteractionUpdateSchema,
   TextDeltaUpdateSchema,
 } from "../src/proto/agent_pb.ts";
@@ -134,7 +140,40 @@ function textFrame(text: string): Buffer {
   const message = create(AgentServerMessageSchema, {
     message: { case: "interactionUpdate", value: update },
   });
-  const bytes = toBinary(AgentServerMessageSchema, message);
+  return connectFrame(toBinary(AgentServerMessageSchema, message));
+}
+
+/** One Connect data frame carrying Cursor's AskQuestion interaction query. */
+function askQuestionFrame(toolCallId: string, runAsync = false): Buffer {
+  const args = create(AskQuestionArgsSchema, {
+    title: "Preferences",
+    questions: [
+      create(AskQuestionArgs_QuestionSchema, {
+        id: "q1",
+        prompt: "Pick one",
+        options: [
+          create(AskQuestionArgs_OptionSchema, { id: "o1", label: "Yes" }),
+          create(AskQuestionArgs_OptionSchema, { id: "o2", label: "No" }),
+        ],
+        allowMultiple: false,
+      }),
+    ],
+    runAsync,
+  });
+  const query = create(InteractionQuerySchema, {
+    id: 21,
+    query: {
+      case: "askQuestionInteractionQuery",
+      value: create(AskQuestionInteractionQuerySchema, { args, toolCallId }),
+    },
+  });
+  const message = create(AgentServerMessageSchema, {
+    message: { case: "interactionQuery", value: query },
+  });
+  return connectFrame(toBinary(AgentServerMessageSchema, message));
+}
+
+function connectFrame(bytes: Uint8Array): Buffer {
   const frame = Buffer.alloc(5 + bytes.length);
   frame[0] = 0;
   frame.writeUInt32BE(bytes.length, 1);
@@ -142,12 +181,18 @@ function textFrame(text: string): Buffer {
   return frame;
 }
 
-function chatRequest(port: number, signal?: AbortSignal, body = streamBody()): Promise<Response> {
+function chatRequest(
+  port: number,
+  signal?: AbortSignal,
+  body = streamBody(),
+  session = "",
+): Promise<Response> {
   return fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
     method: "POST",
     headers: {
       authorization: `Bearer ${TOKEN}`,
       "content-type": "application/json",
+      ...(session ? { "x-maki-session": session } : {}),
     },
     body: JSON.stringify(body),
     signal,
@@ -467,6 +512,245 @@ test("non-streaming collects the text delta", { timeout: 15_000 }, async () => {
     const payload = JSON.parse(await withTimeout(response.text(), 10_000, "no JSON body"));
     assert.equal(payload.choices[0].message.content, "hello");
     assert.equal(payload.choices[0].finish_reason, "stop");
+  } finally {
+    stopProxy();
+  }
+});
+
+test("an AskQuestion interaction becomes a maki question tool call", { timeout: 15_000 }, async () => {
+  upstreamSetup((stream) => {
+    respondSilent(stream);
+    stream.write(askQuestionFrame("call_ask"));
+    setTimeout(() => {
+      if (!stream.closed && !stream.destroyed) stream.end();
+    }, 300);
+  });
+
+  const port = await startProxy(async () => "unused", [], 0, TOKEN);
+  try {
+    const response = await withTimeout(
+      chatRequest(port, undefined, {
+        ...streamBody(),
+        tools: [
+          {
+            type: "function",
+            function: {
+              name: "question",
+              description: "Ask the user questions",
+              parameters: { type: "object", properties: { questions: { type: "array" } } },
+            },
+          },
+        ],
+      }),
+      5_000,
+      "no response headers",
+    );
+    const text = await withTimeout(readAll(response), 10_000, "the question turn hung");
+
+    assert.match(text, /"name":"question"/);
+    assert.match(text, /"id":"call_ask"/);
+    const calls = [...text.matchAll(/data: (\{.*\})/g)]
+      .map((match) => JSON.parse(match[1]!))
+      .flatMap((chunk) => chunk.choices?.[0]?.delta?.tool_calls ?? []);
+    const call = calls.find((item) => item.function?.name === "question");
+    assert.ok(call, "the proxy must expose the question as a tool call, not silence");
+    const args = JSON.parse(call.function.arguments);
+    assert.deepEqual(args.questions, [
+      {
+        question: "Pick one",
+        header: "Q1",
+        options: [{ label: "Yes" }, { label: "No" }],
+        multiSelect: false,
+      },
+    ]);
+  } finally {
+    stopProxy();
+  }
+});
+
+test("an AskQuestion answer resumes the same bridge", { timeout: 20_000 }, async () => {
+  const { promise: interactionSeen, resolve: onInteraction } = Promise.withResolvers<number>();
+  const clientMessages: Array<ReturnType<typeof fromBinary<typeof AgentClientMessageSchema>>> = [];
+  let streamRef: http2.ServerHttp2Stream | undefined;
+  let pending = Buffer.alloc(0);
+
+  upstreamSetup((stream) => {
+    streamRef = stream;
+    respondSilent(stream);
+    stream.write(askQuestionFrame("call_ask"));
+    stream.on("data", (chunk: Buffer) => {
+      pending = Buffer.concat([pending, chunk]);
+      while (pending.length >= 5) {
+        const length = pending.readUInt32BE(1);
+        if (pending.length < 5 + length) break;
+        const payload = pending.subarray(5, 5 + length);
+        pending = pending.subarray(5 + length);
+        try {
+          const message = fromBinary(AgentClientMessageSchema, payload);
+          clientMessages.push(message);
+          if (message.message.case === "interactionResponse") {
+            onInteraction(message.message.value.id);
+          }
+        } catch {
+          // Not a client message frame; ignore.
+        }
+      }
+    });
+  });
+
+  const tools = [
+    {
+      type: "function",
+      function: {
+        name: "question",
+        description: "Ask the user questions",
+        parameters: { type: "object", properties: { questions: { type: "array" } } },
+      },
+    },
+  ];
+  const port = await startProxy(async () => "unused", [], 0, TOKEN);
+  try {
+    const first = await withTimeout(
+      chatRequest(port, undefined, { ...streamBody(), tools }, "session-a"),
+      5_000,
+      "no response headers",
+    );
+    const firstText = await withTimeout(readAll(first), 10_000, "the question turn hung");
+    const calls = [...firstText.matchAll(/data: (\{.*\})/g)]
+      .map((match) => JSON.parse(match[1]!))
+      .flatMap((chunk) => chunk.choices?.[0]?.delta?.tool_calls ?? []);
+    const call = calls.find((item) => item.function?.name === "question");
+    assert.ok(call, "the question was not exposed as a tool call");
+    assert.equal(call.id, "call_ask");
+
+    const second = await withTimeout(
+      chatRequest(
+        port,
+        undefined,
+        {
+          model: "test-model",
+          stream: true,
+          tools,
+          messages: [
+            { role: "user", content: "hi" },
+            {
+              role: "assistant",
+              content: null,
+              tool_calls: [
+                {
+                  id: call.id,
+                  type: "function",
+                  function: { name: "question", arguments: call.function.arguments },
+                },
+              ],
+            },
+            { role: "tool", tool_call_id: call.id, content: "Q1: Yes" },
+          ],
+        },
+        "session-a",
+      ),
+      5_000,
+      "the resume request got no headers",
+    );
+
+    const interactionId = await withTimeout(
+      interactionSeen,
+      5_000,
+      "the proxy never answered the interaction query",
+    );
+    assert.equal(interactionId, 21);
+    const interaction = clientMessages.find(
+      (message) => message.message.case === "interactionResponse",
+    );
+    assert.ok(interaction);
+    const response = interaction.message.value;
+    assert.equal(response.result.case, "askQuestionInteractionResponse");
+    const result = response.result.value.result;
+    assert.equal(result?.result.case, "success");
+    if (result?.result.case === "success") {
+      assert.deepEqual(
+        result.result.value.answers.map((answer) => [
+          answer.questionId,
+          answer.selectedOptionIds,
+        ]),
+        [["q1", ["o1"]]],
+      );
+    }
+
+    // The upstream continues on the same run after the answer.
+    assert.ok(streamRef);
+    streamRef.write(textFrame("resumed"));
+    setTimeout(() => {
+      if (!streamRef!.closed && !streamRef!.destroyed) streamRef!.end();
+    }, 100);
+    const secondText = await withTimeout(readAll(second), 10_000, "the resumed turn hung");
+    assert.match(secondText, /"content":"resumed"/);
+    assert.match(secondText, /data: \[DONE\]/);
+  } finally {
+    stopProxy();
+  }
+});
+
+test("an async AskQuestion is rejected instead of falsely succeeding", { timeout: 15_000 }, async () => {
+  const { promise: interactionSeen, resolve: onInteraction } = Promise.withResolvers<number>();
+  const clientMessages: Array<ReturnType<typeof fromBinary<typeof AgentClientMessageSchema>>> = [];
+  let pending = Buffer.alloc(0);
+
+  upstreamSetup((stream) => {
+    respondSilent(stream);
+    stream.write(askQuestionFrame("call_async", true));
+    stream.on("data", (chunk: Buffer) => {
+      pending = Buffer.concat([pending, chunk]);
+      while (pending.length >= 5) {
+        const length = pending.readUInt32BE(1);
+        if (pending.length < 5 + length) break;
+        const payload = pending.subarray(5, 5 + length);
+        pending = pending.subarray(5 + length);
+        try {
+          const message = fromBinary(AgentClientMessageSchema, payload);
+          clientMessages.push(message);
+          if (message.message.case === "interactionResponse") {
+            onInteraction(message.message.value.id);
+          }
+        } catch {
+          // Not a client message frame.
+        }
+      }
+    });
+    setTimeout(() => {
+      if (!stream.closed && !stream.destroyed) stream.end();
+    }, 300);
+  });
+
+  const port = await startProxy(async () => "unused", [], 0, TOKEN);
+  try {
+    const response = await withTimeout(
+      chatRequest(port, undefined, {
+        ...streamBody(),
+        tools: [
+          {
+            type: "function",
+            function: {
+              name: "question",
+              description: "Ask the user questions",
+              parameters: { type: "object", properties: { questions: { type: "array" } } },
+            },
+          },
+        ],
+      }),
+      5_000,
+      "no response headers",
+    );
+    const text = await withTimeout(readAll(response), 10_000, "the async question hung");
+    assert.doesNotMatch(text, /"name":"question"/, "async must not be bridged as a blocking form");
+    await withTimeout(interactionSeen, 5_000, "no interaction response for the async question");
+    const interaction = clientMessages.find(
+      (message) => message.message.case === "interactionResponse",
+    );
+    assert.ok(interaction);
+    const answer = interaction.message.value.result;
+    assert.equal(answer.case, "askQuestionInteractionResponse");
+    assert.equal(answer.value.result?.result.case, "rejected");
   } finally {
     stopProxy();
   }

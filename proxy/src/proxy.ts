@@ -66,6 +66,7 @@ import {
   type AgentServerMessage,
   type ConversationStateStructure,
   type ExecServerMessage,
+  type InteractionQuery,
   type KvServerMessage,
   type McpToolDefinition,
 } from "./proto/agent_pb.ts";
@@ -88,6 +89,14 @@ import {
   pauseConversationKey,
 } from "./session-key.ts";
 import { classifyExec, streamCloseMessage, unavailableExec } from "./exec-reply.ts";
+import {
+  buildAskQuestionResponse,
+  buildAskQuestionResult,
+  buildQuestionToolArgs,
+  buildRejectedInteractionResponse,
+  QUESTION_TOOL_NAME,
+  type AskQuestionInteraction,
+} from "./ask-question.ts";
 import { proxyLog } from "./log.ts";
 
 const CURSOR_API_URL = process.env.CURSOR_API_URL ?? "https://api2.cursor.sh";
@@ -156,6 +165,8 @@ interface PendingExec {
   decodedArgs: string;
   /** Set when this exec is a redirected native tool call (issue #21/#29). */
   native?: NativeExecBinding;
+  /** Set when this tool call is a Cursor AskQuestion waiting for the user. */
+  interaction?: AskQuestionInteraction;
 }
 
 /** A bridge kept alive across requests for tool result continuation. */
@@ -178,6 +189,22 @@ interface ActiveBridge {
 function destroyActiveBridge(key: string, active: ActiveBridge): void {
   clearInterval(active.heartbeatTimer);
   if (activeBridges.get(key) === active) activeBridges.delete(key);
+  // An unanswered AskQuestion must not leave the upstream waiting on the
+  // interaction after we reap the bridge. Tell it the question was rejected.
+  for (const exec of active.pendingExecs) {
+    if (!exec.interaction) continue;
+    const rejected = buildRejectedInteractionResponse(
+      exec.interaction.id,
+      "askQuestionInteractionQuery",
+    );
+    if (!rejected) continue;
+    try {
+      active.bridge.write(frameConnectMessage(rejected));
+      proxyLog(`askQuestion answered id=${exec.interaction.id} result=rejected (teardown)`);
+    } catch {
+      // The bridge is already gone.
+    }
+  }
   closeBridgeGracefully(active.bridge);
 }
 
@@ -1454,6 +1481,13 @@ function processServerMessage(
       sendFrame,
       onMcpExec,
     );
+  } else if (msgCase === "interactionQuery") {
+    handleInteractionQuery(
+      msg.message.value as InteractionQuery,
+      mcpTools,
+      sendFrame,
+      onMcpExec,
+    );
   } else if (msgCase === "conversationCheckpointUpdate") {
     const stateStructure = msg.message.value as ConversationStateStructure;
     if (stateStructure.tokenDetails) {
@@ -1463,6 +1497,61 @@ function processServerMessage(
       onCheckpoint(toBinary(ConversationStateStructureSchema, stateStructure));
     }
   }
+}
+
+/**
+ * Cursor asks for user input through an InteractionQuery on the open run.
+ * Answering it with the matching InteractionResponse is mandatory: ignoring it
+ * leaves the model waiting forever, which is what a plan/build turn looked
+ * like when AskQuestion was used. AskQuestion is bridged to maki's `question`
+ * tool; every other query gets an immediate rejection so it cannot stall.
+ */
+function handleInteractionQuery(
+  query: InteractionQuery,
+  mcpTools: McpToolDefinition[],
+  sendFrame: (data: Uint8Array) => void,
+  onMcpExec: (exec: PendingExec) => void,
+): void {
+  const queryCase = query.query.case;
+
+  if (queryCase === "askQuestionInteractionQuery") {
+    const value = query.query.value;
+    const args = value.args;
+    if (args && (args.runAsync || args.asyncOriginalToolCallId)) {
+      // The async protocol expects an AskQuestionResult.async marker and a
+      // later AsyncAskQuestionCompletionAction. This proxy cannot send that
+      // action, so reject immediately instead of falsely succeeding later.
+      const rejected = buildRejectedInteractionResponse(query.id, queryCase);
+      if (rejected) sendFrame(frameConnectMessage(rejected));
+      proxyLog(`askQuestion interaction id=${query.id} rejected (async unsupported)`);
+      return;
+    }
+    if (args && mcpTools.some((tool) => tool.name === QUESTION_TOOL_NAME)) {
+      proxyLog(
+        `askQuestion interaction id=${query.id} questions=${args.questions.length} bridged`,
+      );
+      onMcpExec({
+        execId: "",
+        execMsgId: 0,
+        toolCallId: value.toolCallId || `ask_${query.id}`,
+        toolName: QUESTION_TOOL_NAME,
+        decodedArgs: buildQuestionToolArgs(args),
+        interaction: { id: query.id, args },
+      });
+      return;
+    }
+    const rejected = buildRejectedInteractionResponse(query.id, queryCase);
+    if (rejected) sendFrame(frameConnectMessage(rejected));
+    proxyLog(`askQuestion interaction id=${query.id} rejected (no question tool)`);
+    return;
+  }
+
+  const response = buildRejectedInteractionResponse(query.id, queryCase);
+  if (response) {
+    sendFrame(frameConnectMessage(response));
+    return;
+  }
+  proxyLog(`unsupported interaction query: ${queryCase ?? "none"}`);
 }
 
 function handleInteractionUpdate(
@@ -2094,6 +2183,7 @@ export interface AnsweredExec {
   execMsgId: number;
   toolCallId: string;
   native?: NativeExecBinding;
+  interaction?: AskQuestionInteraction;
 }
 
 /**
@@ -2119,6 +2209,20 @@ export function answerPendingExecs(
     let text = result ? result.content : "Tool result not provided";
     if (userText && exec.execId === lastExecId) {
       text += `\n\n<user_message>\n${userText}\n</user_message>`;
+    }
+
+    // AskQuestion was bridged to maki's `question` tool. The upstream is
+    // waiting on an InteractionResponse, not an exec result, so answer the
+    // interaction and let the same bridge continue.
+    if (exec.interaction) {
+      const answer = buildAskQuestionResult(exec.interaction.args, text);
+      proxyLog(
+        `askQuestion answered id=${exec.interaction.id} result=${answer.result.case ?? "none"}`,
+      );
+      write(
+        frameConnectMessage(buildAskQuestionResponse(exec.interaction.id, answer)),
+      );
+      continue;
     }
 
     if (result && exec.native) {
@@ -2311,7 +2415,17 @@ async function collectFullResponse(
             const { content } = tagFilter.process(text);
             fullText += content;
           },
-          () => {},
+          (exec) => {
+            // A non-streaming turn cannot pause for a tool result. Reject an
+            // AskQuestion explicitly so the model does not wait forever for
+            // an answer this path can never deliver.
+            if (!exec.interaction) return;
+            const rejected = buildRejectedInteractionResponse(
+              exec.interaction.id,
+              "askQuestionInteractionQuery",
+            );
+            if (rejected) bridge.write(frameConnectMessage(rejected));
+          },
           (checkpointBytes) => {
             const stored = conversationStates.get(convKey);
             if (stored) {
