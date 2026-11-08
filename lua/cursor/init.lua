@@ -88,8 +88,12 @@ local function run(command, extra, timeout_ms)
   return maki.fn.jobwait(id, timeout_ms or 30000)
 end
 
+-- `string.gsub` also returns how many substitutions it made. The extra
+-- parentheses drop that count. Without them, `maki.json.decode(trimmed(s))`
+-- receives the count as its options table and raises
+-- "error converting Lua integer to table".
 local function trimmed(text)
-  return (text or ""):gsub("%s+$", "")
+  return ((text or ""):gsub("%s+$", ""))
 end
 
 local function failed(result, fallback)
@@ -105,9 +109,11 @@ end
 -- A plain `return nil, "string"` is decoded as a successful nil. Maki then
 -- reports "invalid type: nil, expected table" and keeps the static catalogue.
 local function provider_fail(message)
+  local text = message or "cursor provider failed"
+  maki.log.warn(text)
   return nil, maki.provider.http_error({
     status = 503,
-    body = message or "cursor provider failed",
+    body = text,
   })
 end
 
@@ -342,6 +348,7 @@ function M.setup(root)
       if #rows == 0 then
         return provider_fail("cursor model list was empty")
       end
+      maki.log.info("listed " .. #rows .. " cursor models")
       return rows
     end,
 
