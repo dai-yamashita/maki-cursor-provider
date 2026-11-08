@@ -88,6 +88,7 @@ import {
   pauseConversationKey,
 } from "./session-key.ts";
 import { classifyExec, streamCloseMessage, unavailableExec } from "./exec-reply.ts";
+import { proxyLog } from "./log.ts";
 
 const CURSOR_API_URL = process.env.CURSOR_API_URL ?? "https://api2.cursor.sh";
 const CONNECT_END_STREAM_FLAG = 0b00000010;
@@ -159,18 +160,56 @@ interface PendingExec {
 
 /** A bridge kept alive across requests for tool result continuation. */
 interface ActiveBridge {
-  bridge: ReturnType<typeof spawnBridge>;
+  bridge: Bridge;
   heartbeatTimer: NodeJS.Timeout;
   blobStore: Map<string, Uint8Array>;
   mcpTools: McpToolDefinition[];
   cloudRule?: string;
   pendingExecs: PendingExec[];
+  /** When the bridge was paused for a tool result; used for TTL eviction. */
+  createdAt: number;
+}
+
+/**
+ * Tear a paused bridge down: stop its heartbeat, drop it from the resumable
+ * map (only if that entry is still this bridge), and end the subprocess.
+ * Safe to call from several paths because each step tolerates repetition.
+ */
+function destroyActiveBridge(key: string, active: ActiveBridge): void {
+  clearInterval(active.heartbeatTimer);
+  if (activeBridges.get(key) === active) activeBridges.delete(key);
+  closeBridgeGracefully(active.bridge);
+}
+
+/**
+ * End the bridge's stdin so it can finish the upstream stream, then reap it if
+ * it is still alive shortly after. Killing in the same tick as end() races the
+ * zero-length frame through the pipe and turns a clean cancellation into a TCP
+ * teardown, which Cursor bills as an abandoned run.
+ */
+function closeBridgeGracefully(bridge: Bridge): void {
+  try {
+    bridge.end();
+  } catch {
+    // Already closed.
+  }
+  const timer = setTimeout(() => bridge.kill(), 250);
+  timer.unref?.();
 }
 
 // Active bridges keyed by a session token (derived from conversation state).
 // When tool_calls are returned, the bridge stays alive. The next request
 // with tool results looks up the bridge and sends mcpResult messages.
 const activeBridges = new Map<string, ActiveBridge>();
+
+/** How often to emit an SSE comment while the model is silent. */
+const SSE_KEEPALIVE_MS = (() => {
+  const raw = process.env.CURSOR_SSE_KEEPALIVE_MS;
+  const parsed = raw === undefined ? Number.NaN : Number.parseInt(raw, 10);
+  // An unparseable or non-positive value falls back to the default rather
+  // than failing a request.
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 15_000;
+})();
 
 interface StoredConversation {
   conversationId: string;
@@ -285,6 +324,21 @@ function evictStaleConversations(): void {
   }
 }
 
+/**
+ * Drop bridges paused for tool results that were never resumed. Without this
+ * a caller that exits mid tool call leaves a subprocess and a heartbeat
+ * interval running for the life of the proxy.
+ */
+function evictStaleBridges(): void {
+  const now = Date.now();
+  for (const [key, active] of activeBridges) {
+    if (now - active.createdAt > CONVERSATION_TTL_MS) {
+      proxyLog(`bridge ${key.slice(0, 12)} evicted after tool result timeout`);
+      destroyActiveBridge(key, active);
+    }
+  }
+}
+
 /** Length-prefix a message: [4-byte BE length][payload] */
 function lpEncode(data: Uint8Array): Buffer {
   const buf = Buffer.alloc(4 + data.length);
@@ -314,23 +368,73 @@ interface SpawnBridgeOptions {
   unary?: boolean;
 }
 
-function spawnBridge(options: SpawnBridgeOptions): {
+/** How much bridge stderr to keep for diagnostics. */
+const BRIDGE_STDERR_BYTES = 4 * 1024;
+
+type Bridge = {
   proc: ChildProcess;
   write: (data: Uint8Array) => void;
   end: () => void;
   onData: (cb: (chunk: Buffer) => void) => void;
   onClose: (cb: (code: number) => void) => void;
+  /** Last few KB the bridge wrote to stderr, for error reporting. */
+  stderrTail: () => string;
+  /** Terminate the subprocess; safe to call more than once. */
+  kill: () => void;
   /** True while the bridge subprocess is still running. */
   get alive(): boolean;
-} {
-  const proc = spawn(process.execPath, [BRIDGE_PATH], {
-    stdio: ["pipe", "pipe", "ignore"],
-  });
+};
+
+// Every live bridge, including ones that are not resumable (unary calls,
+// non-streaming runs). stopProxy() and request aborts use this to make sure
+// no child process outlives the request that started it.
+const liveBridges = new Set<Bridge>();
+
+/** Kill every live bridge; used when the proxy shuts down. */
+function killLiveBridges(): void {
+  for (const bridge of liveBridges) bridge.kill();
+  liveBridges.clear();
+}
+
+/** Live bridge count; test-only so abort reaping can be asserted. */
+export function liveBridgeCountForTests(): number {
+  return liveBridges.size;
+}
+
+function spawnBridge(options: SpawnBridgeOptions): Bridge {
+  let stderrTail = "";
+  let proc: ChildProcess;
+  try {
+    proc = spawn(process.execPath, [BRIDGE_PATH], {
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+  } catch (err) {
+    proxyLog(`bridge spawn failed: ${err instanceof Error ? err.message : String(err)}`);
+    throw err;
+  }
   const stdin = proc.stdin;
   const stdout = proc.stdout;
+  const stderr = proc.stderr;
   if (!stdin || !stdout) {
+    proxyLog("bridge spawn failed: no stdin/stdout pipe");
+    // Do not orphan the child just because a pipe is missing.
+    try {
+      proc.kill();
+    } catch {
+      // Already gone.
+    }
     throw new Error("failed to pipe the cursor bridge");
   }
+  // A write into a pipe whose child died surfaces asynchronously as an
+  // 'error' event. Without this listener it is an uncaught exception, and
+  // cli.ts exits the whole proxy, killing every in-flight session.
+  stdin.on("error", () => {});
+  // Drain stderr so the child can never block on a full pipe, keeping only
+  // the tail. The bridge never prints tokens, so this is safe to log.
+  stderr?.on("data", (chunk: Buffer) => {
+    stderrTail = (stderrTail + chunk.toString("utf8")).slice(-BRIDGE_STDERR_BYTES);
+  });
+  stderr?.on("error", () => {});
 
   const config = JSON.stringify({
     accessToken: options.accessToken,
@@ -363,21 +467,15 @@ function spawnBridge(options: SpawnBridgeOptions): {
   };
 
   stdout.on("data", (value: Buffer) => takeFrames(value));
-  const finish = (code: number) => {
-    if (exited) return;
-    exited = true;
-    exitCode = code;
-    cbs.close?.(code);
-  };
-  proc.on("exit", (code) => finish(code ?? 1));
-  proc.on("error", () => finish(1));
+  stdout.on("error", () => {});
 
-  return {
+  const bridge: Bridge = {
     proc,
     get alive() {
       return !exited;
     },
     write(data) {
+      if (exited) return;
       try {
         stdin.write(lpEncode(data));
       } catch {
@@ -385,11 +483,23 @@ function spawnBridge(options: SpawnBridgeOptions): {
       }
     },
     end() {
+      if (exited) return;
       try {
         stdin.write(lpEncode(new Uint8Array(0)));
         stdin.end();
       } catch {
         // The bridge already closed.
+      }
+    },
+    stderrTail() {
+      return stderrTail.trim();
+    },
+    kill() {
+      if (exited) return;
+      try {
+        proc.kill();
+      } catch {
+        // Already reaped.
       }
     },
     onData(cb) {
@@ -405,6 +515,31 @@ function spawnBridge(options: SpawnBridgeOptions): {
       }
     },
   };
+
+  liveBridges.add(bridge);
+
+  const finish = (code: number) => {
+    if (exited) return;
+    exited = true;
+    exitCode = code;
+    liveBridges.delete(bridge);
+    // A bridge that dies on its own is worth a log line; stdin/stdout
+    // shutdowns already have a caller that knows why.
+    if (code !== 0) {
+      const tail = bridge.stderrTail();
+      proxyLog(
+        `bridge pid ${proc.pid ?? "?"} exited ${code}${tail ? `: ${tail}` : ""}`,
+      );
+    }
+    cbs.close?.(code);
+  };
+  proc.on("exit", (code) => finish(code ?? 1));
+  proc.on("error", (err) => {
+    proxyLog(`bridge pid ${proc.pid ?? "?"} error: ${err.message}`);
+    finish(1);
+  });
+
+  return bridge;
 }
 
 interface CursorUnaryRpcOptions {
@@ -463,6 +598,7 @@ let proxyPort: number | undefined;
 let proxyAccessTokenProvider: (() => Promise<string>) | undefined;
 let proxyModels: Array<{ id: string; name: string }> = [];
 let proxyToken = "";
+let bridgeSweepTimer: NodeJS.Timeout | undefined;
 
 function buildOpenAIModelList(models: ReadonlyArray<{ id: string; name: string }>): Array<{
   id: string;
@@ -516,23 +652,119 @@ function headerPairs(headers: http.IncomingHttpHeaders): [string, string][] {
   return pairs;
 }
 
-async function writeNodeResponse(res: http.ServerResponse, response: Response): Promise<void> {
+/**
+ * Resolve true when the socket can take more bytes again, false when it died
+ * or stayed blocked for longer than any real turn can justify. A client that
+ * stops reading must not park the request (and its bridge) forever.
+ */
+function awaitWriteDrain(res: http.ServerResponse): Promise<boolean> {
+  if (res.destroyed || res.writableEnded) return Promise.resolve(false);
+  return new Promise((resolvePromise) => {
+    const timer = setTimeout(() => settle(false), 30_000);
+    timer.unref?.();
+    const settle = (writable: boolean) => {
+      clearTimeout(timer);
+      res.off("drain", onDrain);
+      res.off("close", onGone);
+      res.off("error", onGone);
+      resolvePromise(writable);
+    };
+    const onDrain = () => settle(true);
+    const onGone = () => settle(false);
+    res.on("drain", onDrain);
+    res.on("close", onGone);
+    res.on("error", onGone);
+  });
+}
+
+/**
+ * Copy a fetch Response to a Node response.
+ *
+ * Headers are flushed before the first byte of body so a caller that streams
+ * slowly still sees a response (and so an idle-timeout client is never left
+ * waiting on a socket with no reply). Cancelling the reader on close runs the
+ * stream's cancel() handler, which is what propagates a client abort to the
+ * upstream bridge instead of leaking it.
+ */
+export async function writeNodeResponse(
+  res: http.ServerResponse,
+  response: Response,
+): Promise<void> {
   const headers: Record<string, string> = {};
   response.headers.forEach((value, key) => {
     headers[key] = value;
   });
   res.writeHead(response.status, headers);
+  // Send headers now: the SSE body may stay quiet for a long time.
+  res.flushHeaders();
+
   if (!response.body) {
-    res.end();
+    endWritable(res);
     return;
   }
+
   const reader = response.body.getReader();
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    res.write(Buffer.from(value));
+  let aborted = false;
+  let clientGone = false;
+  const onClose = () => {
+    if (aborted) return;
+    clientGone = true;
+    aborted = true;
+    // Client hung up (or the socket errored): stop pulling so the stream's
+    // cancel() can tear the bridge down. Never throw from this path.
+    void reader.cancel().catch(() => {});
+  };
+  res.on("close", onClose);
+  res.on("error", onClose);
+
+  try {
+    while (!aborted) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (res.destroyed || res.writableEnded) {
+        aborted = true;
+        break;
+      }
+      if (!res.write(Buffer.from(value))) {
+        // Honour backpressure, but do not wait forever on a dead or stalled
+        // client: a stalled reader is an abort, not a reason to hold a bridge.
+        const writable = await awaitWriteDrain(res);
+        if (!writable || res.destroyed || res.writableEnded) {
+          aborted = true;
+          break;
+        }
+      }
+    }
+  } catch {
+    // A broken pipe or a source stream that errored (controller.error) lands
+    // here. Neither is a normal finish: do not leave the socket open without
+    // a body or an end.
+    aborted = true;
+  } finally {
+    // Detach before ending: res.end() emits "close", which must not be read
+    // as a client abort and cancel an already-finished stream.
+    res.off("close", onClose);
+    res.off("error", onClose);
+    if (aborted) {
+      void reader.cancel().catch(() => {});
+      // The client may still be connected (source error or a stalled reader).
+      // Destroy the response so it sees a truncated transfer, not a hang.
+      if (!clientGone && !res.destroyed) res.destroy();
+    } else {
+      reader.releaseLock();
+      endWritable(res);
+    }
   }
-  res.end();
+}
+
+/** End a response without ever throwing on an already-dead socket. */
+function endWritable(res: http.ServerResponse): void {
+  if (res.destroyed || res.writableEnded) return;
+  try {
+    res.end();
+  } catch {
+    // The client is already gone.
+  }
 }
 
 function loopbackHost(req: Request): boolean {
@@ -625,12 +857,26 @@ export async function startProxy(
       await writeNodeResponse(res, await proxyFetch(request));
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      if (!res.headersSent) {
-        res.writeHead(500, { "content-type": "application/json" });
+      proxyLog(`request failed: ${message}`);
+      if (res.headersSent || res.destroyed) {
+        // The stream already started (or died): ending the socket is all
+        // that is left, and writing a second head would corrupt the response.
+        if (!res.writableEnded) res.destroy();
+        return;
       }
-      res.end(JSON.stringify({ error: { message, type: "server_error" } }));
+      try {
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message, type: "server_error" } }));
+      } catch {
+        // Client disconnected while we were replying.
+      }
     }
   });
+
+  // Keep pooled connections alive longer than the client's idle window so a
+  // reused socket is never closed underneath a request maki is about to send.
+  server.keepAliveTimeout = 65_000;
+  server.headersTimeout = 66_000;
 
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
@@ -642,6 +888,13 @@ export async function startProxy(
   }
   proxyServer = server;
   proxyPort = address.port;
+
+  // Reap bridges abandoned mid-tool-call even when no further request ever
+  // arrives for them. Running the sweeper only on the next request (the old
+  // behaviour) let an exited maki leave a child and upstream run forever.
+  bridgeSweepTimer = setInterval(() => evictStaleBridges(), 60_000);
+  bridgeSweepTimer.unref?.();
+
   return proxyPort;
 }
 
@@ -654,11 +907,15 @@ export function stopProxy(): void {
     proxyToken = "";
     proxyModels = [];
   }
-  for (const active of activeBridges.values()) {
-    clearInterval(active.heartbeatTimer);
-    active.bridge.end();
+  if (bridgeSweepTimer !== undefined) {
+    clearInterval(bridgeSweepTimer);
+    bridgeSweepTimer = undefined;
+  }
+  for (const [key, active] of activeBridges) {
+    destroyActiveBridge(key, active);
   }
   activeBridges.clear();
+  killLiveBridges();
   conversationStates.clear();
 }
 
@@ -706,13 +963,19 @@ async function handleChatCompletion(
   stored.lastAccessMs = Date.now();
   evictStaleConversations();
 
+  // Reclaim any bridge paused for a tool result that is now too old, and any
+  // stale entry under this key, before we decide whether to resume.
+  evictStaleBridges();
+
   const activeBridge = activeBridges.get(lookupBridgeKey);
 
   if (activeBridge && toolResults.length > 0) {
     activeBridges.delete(lookupBridgeKey);
 
     if (activeBridge.bridge.alive) {
-      // Resume the live bridge with tool results
+      // Resume the live bridge with tool results. Ownership of the bridge
+      // (and its heartbeat) moves to the new stream, which clears both when
+      // it ends.
       return handleToolResultResume(
         activeBridge,
         toolResults,
@@ -725,15 +988,12 @@ async function handleChatCompletion(
 
     // Bridge died (timeout, server disconnect, etc.).
     // Clean up and fall through to start a fresh bridge.
-    clearInterval(activeBridge.heartbeatTimer);
-    activeBridge.bridge.end();
+    destroyActiveBridge(lookupBridgeKey, activeBridge);
   }
 
   // Clean up stale bridge if present
   if (activeBridge && activeBridges.has(lookupBridgeKey)) {
-    clearInterval(activeBridge.heartbeatTimer);
-    activeBridge.bridge.end();
-    activeBridges.delete(lookupBridgeKey);
+    destroyActiveBridge(lookupBridgeKey, activeBridge);
   }
 
   // Build the request. When the bridge died mid tool-call, history already
@@ -1510,9 +1770,14 @@ function deterministicUuid(seed: string): string {
   ].join("-");
 }
 
+/** Render a bridge stderr tail as a log suffix, or "" when there is none. */
+function stderrNote(tail: string): string {
+  return tail === "" ? "" : `: ${tail}`;
+}
+
 /** Create an SSE streaming Response that reads from a live bridge. */
 function createBridgeStreamResponse(
-  bridge: ReturnType<typeof spawnBridge>,
+  bridge: Bridge,
   heartbeatTimer: NodeJS.Timeout,
   blobStore: Map<string, Uint8Array>,
   mcpTools: McpToolDefinition[],
@@ -1524,23 +1789,82 @@ function createBridgeStreamResponse(
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
 
+  // Timers and the "did the client leave" decision live outside the stream
+  // source so both the stream's cancel() and every exit path can run the same
+  // shutdown exactly once.
+  let keepaliveTimer: NodeJS.Timeout | undefined;
+  let shutdown: () => void = () => {};
+
   const stream = new ReadableStream({
+    cancel() {
+      // The client aborted (or writeNodeResponse cancelled the reader).
+      // Stop pulling, drop the pause entry, and end the subprocess: nothing
+      // will ever consume this bridge again.
+      shutdown();
+    },
     start(controller) {
       const encoder = new TextEncoder();
       let closed = false;
-      const sendSSE = (data: object) => {
+      /** True once tool_calls were sent and the bridge is parked for resume. */
+      let pausedForToolResult = false;
+
+      const enqueue = (text: string) => {
         if (closed) return;
-        controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
+        try {
+          controller.enqueue(encoder.encode(text));
+        } catch {
+          // The stream was cancelled out from under us.
+          closed = true;
+        }
       };
-      const sendDone = () => {
-        if (closed) return;
-        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+      const sendSSE = (data: object) => enqueue(`data: ${JSON.stringify(data)}\n\n`);
+      const sendDone = () => enqueue("data: [DONE]\n\n");
+
+      const stopKeepalive = () => {
+        if (keepaliveTimer === undefined) return;
+        clearInterval(keepaliveTimer);
+        keepaliveTimer = undefined;
       };
+
       const closeController = () => {
+        stopKeepalive();
         if (closed) return;
         closed = true;
-        controller.close();
+        try {
+          controller.close();
+        } catch {
+          // Already cancelled.
+        }
       };
+
+      /**
+       * The single teardown path. Every exit (clean end, end-stream error,
+       * bridge exit, client abort) goes through here, so timers are cleared
+       * and the controller closed at most once.
+       */
+      shutdown = () => {
+        stopKeepalive();
+        if (pausedForToolResult) {
+          // Parked bridge: keep the heartbeat and the activeBridges entry so
+          // the tool-result request can resume this same stream.
+          return;
+        }
+        clearInterval(heartbeatTimer);
+        if (activeBridges.get(bridgeKey)?.bridge === bridge) {
+          activeBridges.delete(bridgeKey);
+        }
+        // The client is gone (or the turn is over); no one will read this
+        // bridge again, so end it and reap the subprocess.
+        closeBridgeGracefully(bridge);
+      };
+
+      // An SSE comment immediately: it flushes headers through maki's client
+      // and starts the idle clock on a connection that may stay quiet for
+      // minutes while the model thinks.
+      enqueue(": keepalive\n\n");
+      keepaliveTimer = setInterval(() => enqueue(": keepalive\n\n"), SSE_KEEPALIVE_MS);
+      // Do not hold the process open just for a heartbeat comment.
+      keepaliveTimer.unref?.();
 
       const makeChunk = (
         delta: Record<string, unknown>,
@@ -1620,7 +1944,10 @@ function createBridgeStreamResponse(
                   }],
                 }));
 
-                // Keep the bridge alive for tool result continuation.
+                // Keep the bridge alive for tool result continuation. This is
+                // the one path where shutdown() must not touch the heartbeat
+                // or the map entry.
+                pausedForToolResult = true;
                 activeBridges.set(bridgeKey, {
                   bridge,
                   heartbeatTimer,
@@ -1628,11 +1955,14 @@ function createBridgeStreamResponse(
                   mcpTools,
                   cloudRule,
                   pendingExecs: state.pendingExecs,
+                  createdAt: Date.now(),
                 });
 
                 sendSSE(makeChunk({}, "tool_calls"));
                 sendDone();
+                // Only the SSE response ends here; the bridge stays parked.
                 closeController();
+                stopKeepalive();
               },
               (checkpointBytes) => {
                 const stored = conversationStates.get(convKey);
@@ -1659,14 +1989,13 @@ function createBridgeStreamResponse(
             // Surface the error and shut down: the server is done with this
             // stream, and heartbeats would otherwise keep the bridge (and the
             // SSE response) open forever.
+            proxyLog(`cursor end stream error: ${endError.message}`);
             sendSSE(makeChunk({ content: `\n[Error: ${endError.message}]` }));
             sendSSE(makeChunk({}, "stop"));
             sendSSE(makeUsageChunk());
             sendDone();
             closeController();
-            activeBridges.delete(bridgeKey);
-            clearInterval(heartbeatTimer);
-            bridge.end();
+            shutdown();
           }
         },
       );
@@ -1674,6 +2003,9 @@ function createBridgeStreamResponse(
       bridge.onData(processChunk);
 
       bridge.onClose((code) => {
+        // The subprocess is gone, so its heartbeat has nowhere to go. Clear it
+        // here rather than in shutdown(), which deliberately leaves the paused
+        // bridge's interval alone.
         clearInterval(heartbeatTimer);
         const stored = conversationStates.get(convKey);
         if (stored) {
@@ -1681,10 +2013,22 @@ function createBridgeStreamResponse(
           stored.lastAccessMs = Date.now();
           persistConversation(convKey, stored);
         }
+        // A clean exit can still happen while parked (upstream closed after
+        // sending tool calls). Drop the entry here, unconditionally, so a dead
+        // bridge never waits 30 minutes for TTL eviction.
+        if (activeBridges.get(bridgeKey)?.bridge === bridge) {
+          activeBridges.delete(bridgeKey);
+        }
         if (!mcpExecReceived) {
           const flushed = tagFilter.flush();
           if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
           if (flushed.content) sendSSE(makeChunk({ content: flushed.content }));
+          if (code !== 0) {
+            // The bridge crashed before finishing the turn. Tell the caller
+            // instead of ending the answer as if it were complete.
+            proxyLog(`bridge exit ${code} mid-stream${stderrNote(bridge.stderrTail())}`);
+            sendSSE(makeChunk({ content: `\n[Error: cursor bridge exited (${code})]` }));
+          }
           sendSSE(makeChunk({}, "stop"));
           sendSSE(makeUsageChunk());
           sendDone();
@@ -1692,14 +2036,21 @@ function createBridgeStreamResponse(
         } else if (code !== 0) {
           // Bridge died while tool calls are pending (timeout, crash, etc.).
           // Close the SSE stream so the client doesn't hang forever.
-          sendSSE(makeChunk({ content: "\n[Error: bridge connection lost]" }));
-          sendSSE(makeChunk({}, "stop"));
-          sendSSE(makeUsageChunk());
-          sendDone();
-          closeController();
+          proxyLog(`bridge exit ${code} with pending tool calls${stderrNote(bridge.stderrTail())}`);
+          if (!pausedForToolResult) {
+            sendSSE(makeChunk({ content: "\n[Error: bridge connection lost]" }));
+            sendSSE(makeChunk({}, "stop"));
+            sendSSE(makeUsageChunk());
+            sendDone();
+            closeController();
+          }
           // Remove stale entry so the next request doesn't try to resume it.
-          activeBridges.delete(bridgeKey);
+          if (activeBridges.get(bridgeKey)?.bridge === bridge) {
+            activeBridges.delete(bridgeKey);
+          }
         }
+        // The subprocess is gone; release the interval and any map entry.
+        shutdown();
       });
     },
   });
@@ -1711,13 +2062,15 @@ function createBridgeStreamResponse(
 function startBridge(
   accessToken: string,
   requestBytes: Uint8Array,
-): { bridge: ReturnType<typeof spawnBridge>; heartbeatTimer: NodeJS.Timeout } {
+): { bridge: Bridge; heartbeatTimer: NodeJS.Timeout } {
   const bridge = spawnBridge({
     accessToken,
     rpcPath: "/agent.v1.AgentService/Run",
   });
   bridge.write(frameConnectMessage(requestBytes));
   const heartbeatTimer = setInterval(() => bridge.write(makeHeartbeatBytes()), 5_000);
+  // A paused bridge should not be the reason the process cannot exit.
+  heartbeatTimer.unref?.();
   return { bridge, heartbeatTimer };
 }
 
@@ -1840,49 +2193,96 @@ function handleToolResultResume(
   );
 }
 
-async function handleNonStreamingResponse(
+function handleNonStreamingResponse(
   payload: CursorRequestPayload,
   accessToken: string,
   modelId: string,
   convKey: string,
-): Promise<Response> {
+): Response {
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
-  const { text, usage } = await collectFullResponse(payload, accessToken, convKey);
+  const abort = new AbortController();
+  const encoder = new TextEncoder();
 
-  return new Response(
-    JSON.stringify({
-      id: completionId,
-      object: "chat.completion",
-      created,
-      model: modelId,
-      choices: [
-        {
-          index: 0,
-          message: { role: "assistant", content: text },
-          finish_reason: "stop",
-        },
-      ],
-      usage,
-    }),
-    { headers: { "Content-Type": "application/json" } },
-  );
+  // Return the Response before the model finishes, so writeNodeResponse can
+  // flush headers immediately. The old code awaited the whole generation here
+  // and left the client with no response head for over two minutes.
+  const stream = new ReadableStream({
+    async start(controller) {
+      try {
+        const { text, usage, exitCode } = await collectFullResponse(
+          payload,
+          accessToken,
+          convKey,
+          abort.signal,
+        );
+        const failed = exitCode !== 0;
+        const message = failed
+          ? { role: "assistant", content: `\n[Error: cursor bridge exited (${exitCode})]` }
+          : { role: "assistant", content: text };
+        const payloadBody: Record<string, unknown> = {
+          id: completionId,
+          object: "chat.completion",
+          created,
+          model: modelId,
+          choices: [
+            {
+              index: 0,
+              message,
+              finish_reason: failed ? "error" : "stop",
+            },
+          ],
+          usage,
+        };
+        if (failed) {
+          payloadBody.error = {
+            message: `cursor bridge exited (${exitCode})`,
+            type: "upstream_error",
+          };
+        }
+        controller.enqueue(encoder.encode(JSON.stringify(payloadBody)));
+        controller.close();
+      } catch (err) {
+        // A cancelled client no longer has anywhere to put an error.
+        if (!abort.signal.aborted) controller.error(err);
+      }
+    },
+    cancel() {
+      // writeNodeResponse cancels the reader when the client disconnects.
+      abort.abort();
+    },
+  });
+
+  return new Response(stream, { headers: { "Content-Type": "application/json" } });
 }
 
 interface CollectedResponse {
   text: string;
   usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
+  exitCode: number;
 }
 
 async function collectFullResponse(
   payload: CursorRequestPayload,
   accessToken: string,
   convKey: string,
+  signal?: AbortSignal,
 ): Promise<CollectedResponse> {
-  const { promise, resolve } = Promise.withResolvers<CollectedResponse>();
+  const { promise, resolve, reject } = Promise.withResolvers<CollectedResponse>();
   let fullText = "";
 
   const { bridge, heartbeatTimer } = startBridge(accessToken, payload.requestBytes);
+
+  const onAbort = () => {
+    clearInterval(heartbeatTimer);
+    closeBridgeGracefully(bridge);
+    reject(new Error("client aborted"));
+  };
+  if (signal?.aborted) {
+    onAbort();
+  } else {
+    signal?.addEventListener("abort", onAbort, { once: true });
+  }
 
   const state: StreamState = {
     toolCallIndex: 0,
@@ -1929,8 +2329,9 @@ async function collectFullResponse(
     () => {},
   ));
 
-  bridge.onClose(() => {
+  bridge.onClose((code) => {
     clearInterval(heartbeatTimer);
+    signal?.removeEventListener("abort", onAbort);
     const stored = conversationStates.get(convKey);
     if (stored) {
       for (const [k, v] of payload.blobStore) stored.blobStore.set(k, v);
@@ -1944,6 +2345,7 @@ async function collectFullResponse(
     resolve({
       text: fullText,
       usage,
+      exitCode: code,
     });
   });
 

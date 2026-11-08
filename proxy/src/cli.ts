@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { access, appendFile, chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import {
   generateCursorAuthParams,
@@ -9,6 +9,7 @@ import {
   refreshCursorToken,
 } from "./auth.ts";
 import { startFixture } from "./fixture.ts";
+import { proxyLogAndWait } from "./log.ts";
 
 const root = resolve(import.meta.dirname, "..");
 const credentialsPath = process.env.MAKI_CURSOR_CREDENTIALS ?? resolve(root, "credentials.json");
@@ -69,7 +70,6 @@ async function ensure(): Promise<void> {
 }
 
 async function serve(): Promise<void> {
-  const logPath = resolve(dirname(credentialsPath), "proxy.log");
   const failFromServe = (label: string, err: unknown): void => {
     let line = `${label}: `;
     if (err instanceof Error) {
@@ -78,8 +78,7 @@ async function serve(): Promise<void> {
     } else {
       line += String(err);
     }
-    line += "\n";
-    void appendFile(logPath, line).finally(() => {
+    void proxyLogAndWait(line).finally(() => {
       process.exit(1);
     });
   };
