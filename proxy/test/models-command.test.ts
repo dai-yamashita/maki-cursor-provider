@@ -38,7 +38,7 @@ function listen(): Promise<{ port: number; server: Server; hits: () => number }>
   });
 }
 
-test("models waits until discovery publishes an id", { timeout: 15_000 }, async () => {
+test("models waits until discovery publishes an id", { timeout: 15_000 }, async (t) => {
   const fixture = await listen();
   try {
     const child = spawn(
@@ -52,6 +52,8 @@ test("models waits until discovery publishes an id", { timeout: 15_000 }, async 
         },
       },
     );
+    // A hung CLI must not outlive the test timeout and hold the runner open.
+    t.after(() => child.kill("SIGKILL"));
     let stdout = "";
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => {

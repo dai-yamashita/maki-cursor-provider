@@ -92,7 +92,7 @@ test("forget-legacy removes the legacy credential file", () => {
   }
 });
 
-test("refresh prints credentials and writes no legacy file", { timeout: 15_000 }, async () => {
+test("refresh prints credentials and writes no legacy file", { timeout: 15_000 }, async (t) => {
   const dir = mkdtempSync(join(tmpdir(), "maki-cursor-refresh-"));
   const creds = join(dir, "credentials.json");
   const server = http.createServer((_req, res) => {
@@ -116,6 +116,8 @@ test("refresh prints credentials and writes no legacy file", { timeout: 15_000 }
         CURSOR_REFRESH_URL: `http://127.0.0.1:${port}/refresh`,
       },
     });
+    // A hung CLI must not outlive the test timeout and hold the runner open.
+    t.after(() => child.kill("SIGKILL"));
     let stdout = "";
     let stderr = "";
     child.stdout.setEncoding("utf8").on("data", (chunk: string) => { stdout += chunk; });
