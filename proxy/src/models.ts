@@ -8,6 +8,7 @@ import { z } from "zod";
 import { fetchAvailableModels } from "./available-models.ts";
 import { pickerRows, rememberAvailableModels, clearAvailableModels } from "./catalog.ts";
 import { callCursorUnaryRpc } from "./proxy.ts";
+import { proxyLog } from "./log.ts";
 import {
   GetUsableModelsRequestSchema,
   GetUsableModelsResponseSchema,
@@ -114,10 +115,15 @@ export async function getCursorModels(
     apiKey ? fetchCursorUsableModels(apiKey) : Promise.resolve(null),
     apiKey ? fetchAvailableModels(apiKey) : Promise.resolve([]),
   ]);
-  rememberAvailableModels(available);
+  const hasCatalogue = available.length > 0;
+  if (hasCatalogue) {
+    rememberAvailableModels(available);
+  } else {
+    proxyLog("cursor catalogue: AvailableModels unavailable; keeping previous resolution");
+  }
   const base = discovered && discovered.length > 0
     ? discovered
-    : available.length > 0
+    : hasCatalogue
       ? []
       : FALLBACK_MODELS;
   const byId = new Map(base.map((model) => [model.id, model]));
@@ -132,9 +138,12 @@ export async function getCursorModels(
     });
   }
   const models = [...byId.values()].sort((a, b) => a.id.localeCompare(b.id));
-  cachedModels = models.some((model) => model.id === AUTO_MODEL.id)
+  const merged = models.some((model) => model.id === AUTO_MODEL.id)
     ? models
     : [AUTO_MODEL, ...models];
+  // A failed catalogue fetch must not be cached: the next list call retries.
+  if (!hasCatalogue) return merged;
+  cachedModels = merged;
   return cachedModels;
 }
 

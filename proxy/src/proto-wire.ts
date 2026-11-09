@@ -53,7 +53,8 @@ export function delimitedBody(data: Uint8Array): Uint8Array {
 export interface WireField {
   field: number;
   wire: number;
-  /** For length-delimited fields, the bytes after the length. */
+  /** For length-delimited fields, the bytes after the length; for varint and
+   * fixed-width fields, the raw value bytes. */
   body: Uint8Array;
 }
 
@@ -65,11 +66,21 @@ export function readMessage(data: Uint8Array): WireField[] {
     offset = tag.next;
     const field = tag.value >>> 3;
     const wire = tag.value & 7;
+    if (wire === 1 || wire === 5) {
+      const size = wire === 1 ? 8 : 4;
+      const end = offset + size;
+      if (end > data.length) throw new Error("truncated fixed-width field");
+      fields.push({ field, wire, body: data.subarray(offset, end) });
+      offset = end;
+      continue;
+    }
     if (wire === 2) {
       const len = readVarint(data, offset);
       offset = len.next;
-      fields.push({ field, wire, body: data.subarray(offset, offset + len.value) });
-      offset += len.value;
+      const end = offset + len.value;
+      if (end > data.length) throw new Error("truncated length-delimited field");
+      fields.push({ field, wire, body: data.subarray(offset, end) });
+      offset = end;
       continue;
     }
     if (wire === 0) {

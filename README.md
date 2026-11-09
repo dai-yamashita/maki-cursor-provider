@@ -39,6 +39,25 @@ maki models | grep '^cursor/'
 
 プロキシの依存関係は、ログイン時にチェックアウトの `proxy/` へ `npm ci` します。
 
+## 利用枠と状態ディレクトリ
+
+Cursor の「含まれる API 利用枠」が 100% になると、Cursor は auto バケット以外の
+名前付きモデル（GLM / DeepSeek / Claude / GPT など）を `resource_exhausted` または
+`not_found` で拒否します。プロキシは起動時に `GetCurrentPeriodUsage` を読み、枯渇していれば
+上流へ送らずに 400 `insufficient_quota` とリセット日・代替モデルを返します。再試行はしません。
+枠が回復するまで `cursor/auto` か `cursor/composer-2.5` を使ってください。
+
+セッションが別のモデルを保存している場合は、明示的に上書きして再開します。
+
+```sh
+maki -m cursor/composer-2.5 -r <SESSION_ID>
+```
+
+会話の記録は state ディレクトリに保存し、7 日を過ぎたものと、上限を超えた古いものから削除します。
+
+- `MAKI_CURSOR_CONVERSATIONS_MAX_FILES`（既定 5000）
+- `MAKI_CURSOR_CONVERSATIONS_MAX_BYTES`（既定 2 GiB）
+
 ## 困ったとき
 
 `maki auth status` に `cursor` の行が出ないときは、そのプロセスでこのプラグインが登録されていません。

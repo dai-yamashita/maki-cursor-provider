@@ -85,6 +85,19 @@ import {
 } from "./proto/agent_pb.ts";
 import { resolveCursorModel } from "./catalog.ts";
 import {
+  allowsModel,
+  decodeCurrentPeriodUsage,
+  getUsageSnapshot,
+  quotaMessage,
+  setUsageSnapshot,
+  type UsageSnapshot,
+} from "./usage.ts";
+import {
+  conversationPruneLimitsFromEnv,
+  selectConversationFilesToPrune,
+  type ConversationFile,
+} from "./conversation-store.ts";
+import {
   redirectNativeExec,
   sendNativeExecResult,
   type NativeExecBinding,
@@ -373,16 +386,39 @@ async function loadPersistedConversation(
   }
 }
 
-/** Best-effort removal of conversation files past the disk TTL. */
+/** Best-effort removal of conversation files past the disk TTL or over the size cap. */
 function pruneStaleConversationFiles(): void {
   void (async () => {
     try {
-      const entries = await readdir(conversationDir());
-      const cutoff = Date.now() - CONVERSATION_DISK_TTL_MS;
-      for (const entry of entries) {
-        const file = pathResolve(conversationDir(), entry);
-        const info = await stat(file);
-        if (info.mtimeMs < cutoff) await unlink(file);
+      const dir = conversationDir();
+      const names = await readdir(dir);
+      const entries: ConversationFile[] = [];
+      for (const name of names) {
+        try {
+          const info = await stat(pathResolve(dir, name));
+          if (!info.isFile()) continue;
+          entries.push({ name, mtimeMs: info.mtimeMs, size: info.size });
+        } catch {
+          // A file removed between readdir and stat is already gone.
+        }
+      }
+      const limits = conversationPruneLimitsFromEnv(process.env, CONVERSATION_DISK_TTL_MS);
+      const doomed = selectConversationFilesToPrune(entries, Date.now(), limits);
+      for (const name of doomed) {
+        try {
+          await unlink(pathResolve(dir, name));
+        } catch {
+          // Already removed.
+        }
+      }
+      if (doomed.length > 0) {
+        const removed = new Set(doomed);
+        const kept = entries.filter((entry) => !removed.has(entry.name));
+        const keptBytes = kept.reduce((sum, entry) => sum + entry.size, 0);
+        proxyLog(
+          `conversations pruned: ${doomed.length} removed; ` +
+            `kept ${kept.length} files / ${(keptBytes / (1024 * 1024)).toFixed(1)} MB`,
+        );
       }
     } catch {}
   })();
@@ -780,6 +816,112 @@ export async function requestAccessToken(
   return fallback();
 }
 
+/** The wire model Cursor expects for a picker id (auto routes to "default"). */
+export function wireModelIdFor(modelId: string): string {
+  if (modelId === "auto") return "default";
+  return resolveCursorModel(modelId)?.modelId ?? modelId;
+}
+
+/** Log-friendly wire model + parameters, so a rejection can be reproduced. */
+function wireLogFor(modelId: string): string {
+  const resolved = modelId === "auto"
+    ? { modelId: "default", parameters: [] as Array<{ id: string; value: string }> }
+    : resolveCursorModel(modelId);
+  const wire = resolved?.modelId ?? modelId;
+  const params = (resolved?.parameters ?? []).map((p) => `${p.id}=${p.value}`).join(",") || "-";
+  return `wire=${wire} params=${params}`;
+}
+
+let usageRefresh: Promise<UsageSnapshot | null> | null = null;
+
+/**
+ * Fetch Cursor's current billing-period usage. `resource_exhausted` covers both
+ * a transient capacity blip and a hard, month-long quota cap; only this API
+ * tells them apart, and only the hard cap must stop the client from retrying.
+ */
+export async function refreshCursorUsage(accessToken: string): Promise<UsageSnapshot | null> {
+  if (usageRefresh) return usageRefresh;
+  usageRefresh = (async () => {
+    try {
+      const response = await callCursorUnaryRpc({
+        accessToken,
+        rpcPath: "/aiserver.v1.DashboardService/GetCurrentPeriodUsage",
+        requestBody: new Uint8Array(),
+        timeoutMs: 5_000,
+      });
+      if (response.timedOut || response.exitCode !== 0 || response.body.length === 0) {
+        proxyLog("cursor usage: unavailable (continuing)");
+        return getUsageSnapshot();
+      }
+      const snapshot = decodeCurrentPeriodUsage(response.body);
+      if (!snapshot) {
+        proxyLog("cursor usage: undecodable response (continuing)");
+        return getUsageSnapshot();
+      }
+      setUsageSnapshot(snapshot);
+      proxyLog(
+        `cursor usage: api=${percentText(snapshot.apiPercentUsed)} ` +
+          `auto=${percentText(snapshot.autoPercentUsed)} ` +
+          `total=${percentText(snapshot.totalPercentUsed)} ` +
+          `limit=$${moneyText(snapshot.limitCents)} ` +
+          `remaining=$${moneyText(snapshot.remainingCents)} ` +
+          `reset=${snapshot.resetAt ?? "unknown"}`,
+      );
+      return snapshot;
+    } catch (err) {
+      proxyLog(`cursor usage: failed (${err instanceof Error ? err.message : String(err)})`);
+      return getUsageSnapshot();
+    } finally {
+      usageRefresh = null;
+    }
+  })();
+  return usageRefresh;
+}
+
+function percentText(value: number | null): string {
+  return value === null ? "?" : `${value.toFixed(1)}%`;
+}
+
+function moneyText(cents: number): string {
+  return (cents / 100).toFixed(2);
+}
+
+/**
+ * A hard named-model quota cap is not retryable: it lasts until the billing
+ * period rolls over. Reporting it as 503 made maki retry forever (and let
+ * maki-loop keep consuming the same exhausted bucket). 400 is fatal to the
+ * client, so the loop stops and the message can name the reset date and the
+ * models that still work.
+ */
+function effectiveUpstreamFailure(
+  failure: UpstreamFailure,
+  accessToken: string,
+  pickerId: string,
+): UpstreamFailure {
+  if (failure.code !== "resource_exhausted") return failure;
+  // Refresh in the background so a later retry is blocked before it is sent.
+  void refreshCursorUsage(accessToken);
+  const usage = getUsageSnapshot();
+  const wireModelId = wireModelIdFor(pickerId);
+  if (!usage?.apiExhausted || allowsModel(usage, wireModelId)) return failure;
+  const message = quotaMessage(pickerId, wireModelId, usage);
+  proxyLog(`cursor usage limit: ${message}`);
+  return { code: "usage_exhausted", status: 400, type: "insufficient_quota", message };
+}
+
+function quotaExceededResponse(message: string, stream: boolean): Response {
+  const error = { code: 400, type: "insufficient_quota", message };
+  if (stream) {
+    return new Response(`data: ${JSON.stringify({ error })}\n\ndata: [DONE]\n\n`, {
+      headers: SSE_HEADERS,
+    });
+  }
+  return new Response(JSON.stringify({ error }), {
+    status: 400,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
 function buildOpenAIModelList(models: ReadonlyArray<{ id: string; name: string }>): Array<{
   id: string;
   object: "model";
@@ -1106,6 +1248,7 @@ async function handleChatCompletion(
 ): Promise<Response> {
   const { systemPrompts, userText, history, toolResults } = parseMessages(body.messages);
   const modelId = body.model;
+  const wireModelId = wireModelIdFor(modelId);
   const tools = body.tools ?? [];
 
   if (!userText && history.length === 0) {
@@ -1150,8 +1293,8 @@ async function handleChatCompletion(
   const activeBridge = activeBridges.get(lookupBridgeKey);
   const isResume = Boolean(activeBridge && toolResults.length > 0);
   proxyLog(
-    `request model=${modelId} messages=${body.messages.length} tools=${tools.length} ` +
-      `results=${toolResults.length} resume=${isResume} key=${lookupBridgeKey}`,
+    `request model=${modelId} ${wireLogFor(modelId)} messages=${body.messages.length} ` +
+      `tools=${tools.length} results=${toolResults.length} resume=${isResume} key=${lookupBridgeKey}`,
   );
   if (!activeBridge && toolResults.length > 0) {
     // A resume whose key does not match the paused bridge would silently start
@@ -1172,6 +1315,7 @@ async function handleChatCompletion(
         toolResults,
         userText,
         modelId,
+        accessToken,
         storeBridgeKey,
         storeConvKey,
       );
@@ -1185,6 +1329,15 @@ async function handleChatCompletion(
   // Clean up stale bridge if present
   if (activeBridge && activeBridges.has(lookupBridgeKey)) {
     destroyActiveBridge(lookupBridgeKey, activeBridge);
+  }
+
+  // A hard named-model quota cap needs no upstream round trip. A live
+  // tool-result resume returned above and is not blocked here.
+  const usage = getUsageSnapshot();
+  if (usage?.apiExhausted && !allowsModel(usage, wireModelId)) {
+    const message = quotaMessage(modelId, wireModelId, usage);
+    proxyLog(`request blocked: ${message}`);
+    return quotaExceededResponse(message, body.stream !== false);
   }
 
   // Build the request. When the bridge died mid tool-call, history already
@@ -2304,6 +2457,7 @@ function createBridgeStreamResponse(
   mcpTools: McpToolDefinition[],
   cloudRule: string | undefined,
   modelId: string,
+  accessToken: string,
   bridgeKey: string,
   convKey: string,
 ): Response {
@@ -2452,10 +2606,13 @@ function createBridgeStreamResponse(
        */
       const sendStreamFailure = (failure: UpstreamFailure) => {
         if (closed) return;
+        const effective = effectiveUpstreamFailure(failure, accessToken, modelId);
         const flushed = tagFilter.flush();
         if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
         if (flushed.content) sendSSE(makeChunk({ content: flushed.content }));
-        sendSSE({ error: { code: failure.status, type: failure.type, message: failure.message } });
+        sendSSE({
+          error: { code: effective.status, type: effective.type, message: effective.message },
+        });
         sendDone();
         closeController();
       };
@@ -2772,7 +2929,7 @@ function handleStreamingResponse(
   return createBridgeStreamResponse(
     bridge, heartbeatTimer,
     payload.blobStore, payload.mcpTools, payload.cloudRule,
-    modelId, bridgeKey, convKey,
+    modelId, accessToken, bridgeKey, convKey,
   );
 }
 
@@ -2895,6 +3052,7 @@ function handleToolResultResume(
   toolResults: ToolResultInfo[],
   userText: string,
   modelId: string,
+  accessToken: string,
   bridgeKey: string,
   convKey: string,
 ): Response {
@@ -2903,7 +3061,7 @@ function handleToolResultResume(
   const response = createBridgeStreamResponse(
     bridge, heartbeatTimer,
     blobStore, mcpTools, cloudRule,
-    modelId, bridgeKey, convKey,
+    modelId, accessToken, bridgeKey, convKey,
   );
   active.detachClose?.();
   answerPendingExecs(pendingExecs, toolResults, userText, (frame) => bridge.write(frame));
@@ -2933,9 +3091,13 @@ function handleNonStreamingResponse(
           convKey,
           abort.signal,
         );
+        const effectiveUpstream = upstreamError
+          ? effectiveUpstreamFailure(upstreamError, accessToken, modelId)
+          : undefined;
         const failed = exitCode !== 0;
         const detail = errorDetail?.trim() ? `: ${errorDetail.trim()}` : "";
-        const failure = upstreamError?.message ?? `cursor bridge exited (${exitCode})${detail}`;
+        const failure =
+          effectiveUpstream?.message ?? `cursor bridge exited (${exitCode})${detail}`;
         const message = failed
           ? { role: "assistant", content: `\n[Error: ${failure}]` }
           : { role: "assistant", content: text };
@@ -2956,8 +3118,8 @@ function handleNonStreamingResponse(
         if (failed) {
           payloadBody.error = {
             message: failure,
-            type: upstreamError?.type ?? "upstream_error",
-            code: upstreamError?.status ?? 502,
+            type: effectiveUpstream?.type ?? "upstream_error",
+            code: effectiveUpstream?.status ?? 502,
           };
         }
         controller.enqueue(encoder.encode(JSON.stringify(payloadBody)));

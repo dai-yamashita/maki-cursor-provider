@@ -43,13 +43,28 @@ const REASONING = new Set(["none", "minimal", "low", "medium", "high", "xhigh", 
 
 let resolvedByPickerId = new Map<string, ResolvedModel>();
 
+interface BaseModel {
+  name: string;
+  defaultParams: ModelParameter[];
+  maxMode: boolean;
+}
+
+let baseModels = new Map<string, BaseModel>();
+
 export function rememberAvailableModels(models: readonly AvailableModel[]): void {
+  if (models.length === 0) return;
   const next = new Map<string, ResolvedModel>();
+  const bases = new Map<string, BaseModel>();
   for (const model of models) {
     if (!model.supportsAgent || model.chatOnly || model.name === "") continue;
     const fallback = model.variants[0];
     const fallbackParams = fallback?.parameters ?? [];
     const fallbackMax = fallback?.maxMode ?? false;
+    bases.set(model.name, {
+      name: model.name,
+      defaultParams: fallbackParams,
+      maxMode: fallbackMax,
+    });
     remember(next, model.name, {
       modelId: model.name,
       parameters: fallbackParams,
@@ -74,15 +89,40 @@ export function rememberAvailableModels(models: readonly AvailableModel[]): void
     }
   }
   resolvedByPickerId = next;
+  baseModels = bases;
 }
 
 export function clearAvailableModels(): void {
   resolvedByPickerId = new Map();
+  baseModels = new Map();
 }
 
 /** Translate a picker id into the Run request the CLI would send. */
 export function resolveCursorModel(pickerId: string): ResolvedModel | undefined {
-  return resolvedByPickerId.get(pickerId);
+  const exact = resolvedByPickerId.get(pickerId);
+  if (exact) return exact;
+  // proxy.ts owns 'auto'; it never maps onto a catalogue family.
+  if (pickerId === "auto") return undefined;
+  const base = longestBasePrefix(pickerId);
+  if (!base) return undefined;
+  return {
+    modelId: base.name,
+    parameters: parametersForLegacySlug(base.name, pickerId, base.defaultParams),
+    maxMode: base.maxMode,
+  };
+}
+
+function longestBasePrefix(pickerId: string): BaseModel | undefined {
+  let best: BaseModel | undefined;
+  for (const base of baseModels.values()) {
+    if (!pickerId.startsWith(base.name)) continue;
+    if (pickerId.length !== base.name.length) {
+      const boundary = pickerId.charAt(base.name.length);
+      if (/[a-z0-9]/.test(boundary)) continue;
+    }
+    if (!best || base.name.length > best.name.length) best = base;
+  }
+  return best;
 }
 
 export function pickerRows(models: readonly AvailableModel[]): Array<{ id: string; name: string }> {
@@ -131,9 +171,15 @@ function parametersForLegacySlug(
   const suffix = suffixAfter(name, slug);
   if (!suffix) return [...defaults];
   const params = new Map(defaults.map((item) => [item.id, item.value]));
+  // Only touch parameters the family already declares; Cursor rejects unknown
+  // ids (a synthesized `reasoning` alongside `reasoning_effort` fails).
+  const reasoningKey = ["reasoning", "reasoning_effort", "effort"].find((id) => params.has(id));
   for (const token of suffix.split("-")) {
-    if (token === "fast") params.set("fast", "true");
-    else if (REASONING.has(token)) params.set("reasoning", token);
+    if (token === "fast") {
+      if (params.has("fast")) params.set("fast", "true");
+    } else if (REASONING.has(token) && reasoningKey) {
+      params.set(reasoningKey, token);
+    }
   }
   return [...params].map(([id, value]) => ({ id, value }));
 }

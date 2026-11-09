@@ -91,7 +91,7 @@ async function serve(): Promise<void> {
   });
 
   await ensure();
-  const { startProxy, replaceProxyModels } = await import("./proxy.ts");
+  const { startProxy, replaceProxyModels, refreshCursorUsage } = await import("./proxy.ts");
   const { getCursorModels } = await import("./models.ts");
   const envToken = process.env.MAKI_CURSOR_TOKEN;
   const token =
@@ -106,6 +106,9 @@ async function serve(): Promise<void> {
   }
   const models = await getCursorModels(access);
   replaceProxyModels(models.map((model) => ({ id: model.id, name: model.name })));
+  // A hard usage cap must be known before the first run, or the first request
+  // pays for an upstream round trip that is guaranteed to be rejected.
+  await refreshCursorUsage(access);
   await new Promise(() => {});
 }
 
