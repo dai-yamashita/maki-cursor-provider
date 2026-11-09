@@ -270,7 +270,12 @@ test(
       const response = await withTimeout(chatRequest(port), 5_000, "no response headers");
       const text = await withTimeout(readAll(response), 10_000, "the compressed end-stream hung");
 
-      assert.match(text, /\[Error: [^\]]*compressed end[^\]]*\]/);
+      assert.match(
+        text,
+        /"error":\{"code":503,"type":"service_unavailable_error","message":"Connect error resource_exhausted: compressed end"\}/,
+      );
+      assert.doesNotMatch(text, /"finish_reason"/);
+      assert.match(text, /data: \[DONE\]/);
     } finally {
       stopProxy();
     }

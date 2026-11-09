@@ -395,7 +395,11 @@ test("a non-200 upstream becomes an error, not an empty success", { timeout: 15_
     const response = await withTimeout(chatRequest(port), 5_000, "no response headers");
     const text = await withTimeout(readAll(response), 10_000, "the failed turn hung");
 
-    assert.match(text, /\[Error: cursor bridge exited \(1\)\]/);
+    assert.match(
+      text,
+      /"error":\{"code":502,"type":"provider_unavailable","message":"cursor bridge exited \(1\)"\}/,
+    );
+    assert.doesNotMatch(text, /"finish_reason"/);
     assert.match(text, /data: \[DONE\]/);
   } finally {
     stopProxy();

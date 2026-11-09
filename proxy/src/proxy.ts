@@ -1484,18 +1484,80 @@ function buildCursorRequest(
   };
 }
 
-function parseConnectEndStream(data: Uint8Array): Error | null {
+/** A failure reported by the Cursor upstream, shaped for an OpenAI error event. */
+export interface UpstreamFailure {
+  /** Connect/gRPC code from the end-stream frame ("unknown" when absent). */
+  code: string;
+  /** HTTP status the proxy reports; it decides how the client retries. */
+  status: number;
+  /** OpenAI-compatible error type tag. */
+  type: string;
+  /** Human-readable message, including the original Connect code. */
+  message: string;
+}
+
+// Connect/gRPC codes are fixed by the protocol, so this is a literal
+// translation rather than a tunable. `resource_exhausted` is Cursor's
+// capacity/quota reply and clears on its own: 503 tells the client to keep
+// backing off and retrying instead of treating the turn as complete.
+const CONNECT_ERROR_STATUS: Record<string, number> = {
+  canceled: 499,
+  unknown: 500,
+  invalid_argument: 400,
+  deadline_exceeded: 504,
+  not_found: 404,
+  already_exists: 409,
+  permission_denied: 403,
+  resource_exhausted: 503,
+  failed_precondition: 412,
+  aborted: 499,
+  out_of_range: 400,
+  unimplemented: 400,
+  internal: 500,
+  unavailable: 503,
+  data_loss: 500,
+  unauthenticated: 401,
+};
+
+function errorTypeForStatus(status: number): string {
+  switch (status) {
+    case 401: return "authentication_error";
+    case 403: return "permission_error";
+    case 404: return "not_found_error";
+    case 429: return "rate_limit_error";
+    case 500: return "api_error";
+    case 502: return "provider_unavailable";
+    case 503: return "service_unavailable_error";
+    default:
+      return status >= 500 ? "server_error" : "invalid_request_error";
+  }
+}
+
+export function classifyConnectError(code: string, message: string): UpstreamFailure {
+  const status = CONNECT_ERROR_STATUS[code] ?? 502;
+  return {
+    code,
+    status,
+    type: errorTypeForStatus(status),
+    message: `Connect error ${code}: ${message}`,
+  };
+}
+
+function parseConnectEndStream(data: Uint8Array): UpstreamFailure | null {
   try {
     const payload = JSON.parse(new TextDecoder().decode(data));
     const error = payload?.error;
-    if (error) {
-      const code = error.code ?? "unknown";
-      const message = error.message ?? "Unknown error";
-      return new Error(`Connect error ${code}: ${message}`);
-    }
-    return null;
+    if (!error) return null;
+    const code = typeof error.code === "string" ? error.code : "unknown";
+    const message = typeof error.message === "string" ? error.message : "Unknown error";
+    return classifyConnectError(code, message);
   } catch {
-    return new Error("Failed to parse Connect end stream");
+    return {
+      code: "unknown",
+      status: 502,
+      type: "provider_unavailable",
+      message: "Failed to parse Connect end stream",
+    };
   }
 }
 
@@ -2368,6 +2430,21 @@ function createBridgeStreamResponse(
       };
       const tagFilter = createThinkingTagFilter();
 
+      /**
+       * Report a failed upstream run as an OpenAI in-band error. Sending
+       * `finish_reason:"stop"` here would tell the client the turn completed,
+       * which is how a rate-limited run turned into an endless retry loop.
+       */
+      const sendStreamFailure = (failure: UpstreamFailure) => {
+        if (closed) return;
+        const flushed = tagFilter.flush();
+        if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
+        if (flushed.content) sendSSE(makeChunk({ content: flushed.content }));
+        sendSSE({ error: { code: failure.status, type: failure.type, message: failure.message } });
+        sendDone();
+        closeController();
+      };
+
       let mcpExecReceived = false;
 
       // --- Stall watchdog -------------------------------------------------
@@ -2396,13 +2473,12 @@ function createBridgeStreamResponse(
           `bridge ${bridgeKey} stalled: no model progress for ${stalledSeconds}s ` +
             `(server messages ${formatCaseCounts()})`,
         );
-        sendSSE(makeChunk({
-          content: `\n[Error: cursor stream stalled for ${stalledSeconds}s without output; retry the request]`,
-        }));
-        sendSSE(makeChunk({}, "stop"));
-        sendSSE(makeUsageChunk());
-        sendDone();
-        closeController();
+        sendStreamFailure({
+          code: "stalled",
+          status: 504,
+          type: "server_error",
+          message: `cursor stream stalled for ${stalledSeconds}s without output; retry the request`,
+        });
         shutdown();
       }
 
@@ -2552,20 +2628,13 @@ function createBridgeStreamResponse(
             console.error(`[proxy] endStream: ${endError ? endError.message : "clean"}`);
           }
           if (endError) {
-            // Surface the error and shut down: the server is done with this
-            // stream, and heartbeats would otherwise keep the bridge (and the
-            // SSE response) open forever.
+            // The upstream run failed. Report it as an error so the client
+            // retries with backoff instead of treating the turn as complete.
             proxyLog(`cursor end stream error: ${endError.message}`);
             if (activeBridges.get(bridgeKey)?.bridge === bridge) {
               activeBridges.delete(bridgeKey);
             }
-            if (!closed) {
-              sendSSE(makeChunk({ content: `\n[Error: ${endError.message}]` }));
-              sendSSE(makeChunk({}, "stop"));
-              sendSSE(makeUsageChunk());
-              sendDone();
-            }
-            closeController();
+            sendStreamFailure(endError);
             pausedForToolResult = false;
             shutdown();
             return;
@@ -2588,18 +2657,12 @@ function createBridgeStreamResponse(
           if (activeBridges.get(bridgeKey)?.bridge === bridge) {
             activeBridges.delete(bridgeKey);
           }
-          if (closed) {
-            pausedForToolResult = false;
-            shutdown();
-            return;
-          }
-          sendSSE(makeChunk({
-            content: `\n[Error: cursor upstream sent an unframed response: ${protocolError}]`,
-          }));
-          sendSSE(makeChunk({}, "stop"));
-          sendSSE(makeUsageChunk());
-          sendDone();
-          closeController();
+          sendStreamFailure({
+            code: "protocol",
+            status: 502,
+            type: "provider_unavailable",
+            message: `cursor upstream sent an unframed response: ${protocolError}`,
+          });
           pausedForToolResult = false;
           shutdown();
         },
@@ -2622,29 +2685,36 @@ function createBridgeStreamResponse(
           activeBridges.delete(bridgeKey);
         }
         if (!mcpExecReceived) {
-          const flushed = tagFilter.flush();
-          if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
-          if (flushed.content) sendSSE(makeChunk({ content: flushed.content }));
           if (code !== 0) {
-            // The bridge crashed before finishing the turn. Tell the caller
-            // instead of ending the answer as if it were complete.
+            // The bridge crashed before finishing the turn. Report it as an
+            // error so the caller does not end the answer as if it completed.
             proxyLog(`bridge exit ${code} mid-stream${stderrNote(bridge.stderrTail())}`);
-            sendSSE(makeChunk({ content: `\n[Error: cursor bridge exited (${code})]` }));
+            sendStreamFailure({
+              code: "bridge_exit",
+              status: 502,
+              type: "provider_unavailable",
+              message: `cursor bridge exited (${code})`,
+            });
+          } else {
+            const flushed = tagFilter.flush();
+            if (flushed.reasoning) sendSSE(makeChunk({ reasoning_content: flushed.reasoning }));
+            if (flushed.content) sendSSE(makeChunk({ content: flushed.content }));
+            sendSSE(makeChunk({}, "stop"));
+            sendSSE(makeUsageChunk());
+            sendDone();
+            closeController();
           }
-          sendSSE(makeChunk({}, "stop"));
-          sendSSE(makeUsageChunk());
-          sendDone();
-          closeController();
         } else if (code !== 0) {
           // Bridge died while tool calls are pending (timeout, crash, etc.).
           // Close the SSE stream so the client doesn't hang forever.
           proxyLog(`bridge exit ${code} with pending tool calls${stderrNote(bridge.stderrTail())}`);
           if (!pausedForToolResult) {
-            sendSSE(makeChunk({ content: "\n[Error: bridge connection lost]" }));
-            sendSSE(makeChunk({}, "stop"));
-            sendSSE(makeUsageChunk());
-            sendDone();
-            closeController();
+            sendStreamFailure({
+              code: "bridge_lost",
+              status: 502,
+              type: "provider_unavailable",
+              message: "bridge connection lost",
+            });
           }
           // Remove stale entry so the next request doesn't try to resume it.
           if (activeBridges.get(bridgeKey)?.bridge === bridge) {
@@ -2842,7 +2912,7 @@ function handleNonStreamingResponse(
   const stream = new ReadableStream({
     async start(controller) {
       try {
-        const { text, usage, exitCode, errorDetail } = await collectFullResponse(
+        const { text, usage, exitCode, errorDetail, upstreamError } = await collectFullResponse(
           payload,
           accessToken,
           convKey,
@@ -2850,7 +2920,7 @@ function handleNonStreamingResponse(
         );
         const failed = exitCode !== 0;
         const detail = errorDetail?.trim() ? `: ${errorDetail.trim()}` : "";
-        const failure = `cursor bridge exited (${exitCode})${detail}`;
+        const failure = upstreamError?.message ?? `cursor bridge exited (${exitCode})${detail}`;
         const message = failed
           ? { role: "assistant", content: `\n[Error: ${failure}]` }
           : { role: "assistant", content: text };
@@ -2871,7 +2941,8 @@ function handleNonStreamingResponse(
         if (failed) {
           payloadBody.error = {
             message: failure,
-            type: "upstream_error",
+            type: upstreamError?.type ?? "upstream_error",
+            code: upstreamError?.status ?? 502,
           };
         }
         controller.enqueue(encoder.encode(JSON.stringify(payloadBody)));
@@ -2896,6 +2967,8 @@ interface CollectedResponse {
   exitCode: number;
   /** Server error or bridge stderr tail, for the non-streaming error body. */
   errorDetail?: string;
+  /** Structured upstream failure, so the non-streaming body carries its code. */
+  upstreamError?: UpstreamFailure;
 }
 
 async function collectFullResponse(
@@ -2912,7 +2985,7 @@ async function collectFullResponse(
   // Connect's end-stream frame carries a server error after the last message.
   // Without recording it, a failed run looked like a clean "stop" with
   // whatever text had streamed so far.
-  let endError: Error | null = null;
+  let endError: UpstreamFailure | null = null;
 
   // Same progress deadline as the streaming path: a non-streaming request must
   // not sit on an alive-but-stuck bridge forever either. These are defined
@@ -2927,7 +3000,12 @@ async function collectFullResponse(
   const onStall = () => {
     stallTimer = undefined;
     if (endError) return;
-    endError = new Error(`cursor stream stalled for ${stalledSeconds}s without output`);
+    endError = {
+      code: "stalled",
+      status: 504,
+      type: "server_error",
+      message: `cursor stream stalled for ${stalledSeconds}s without output`,
+    };
     proxyLog(`non-streaming bridge stalled: no model progress for ${stalledSeconds}s`);
     clearInterval(heartbeatTimer);
     closeBridgeGracefully(bridge);
@@ -3047,7 +3125,12 @@ async function collectFullResponse(
       closeBridgeGracefully(bridge);
     },
     onProtocolError: (protocolError) => {
-      endError = new Error(`unframed upstream response: ${protocolError}`);
+      endError = {
+        code: "protocol",
+        status: 502,
+        type: "provider_unavailable",
+        message: `unframed upstream response: ${protocolError}`,
+      };
       proxyLog(`cursor protocol error: ${endError.message}`);
       clearInterval(heartbeatTimer);
       closeBridgeGracefully(bridge);
@@ -3077,6 +3160,7 @@ async function collectFullResponse(
       // process exited cleanly.
       exitCode: endError ? 1 : code,
       errorDetail: endError?.message ?? bridge.stderrTail(),
+      upstreamError: endError ?? undefined,
     });
   });
 

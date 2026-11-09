@@ -386,10 +386,12 @@ test("a non-streaming turn reports an end-stream error as a failed completion", 
       await withTimeout(response.text(), 10_000, "no JSON body"),
     ) as {
       choices: { finish_reason: string }[];
-      error?: { type: string };
+      error?: { type: string; code?: number };
     };
     assert.equal(payload.choices[0]!.finish_reason, "error");
-    assert.equal(payload.error?.type, "upstream_error");
+    // `internal` maps to HTTP 500, so maki classifies it as a server error.
+    assert.equal(payload.error?.type, "api_error");
+    assert.equal(payload.error?.code, 500);
     assert.match(logText(), /cursor end stream error: Connect error internal: upstream exploded/);
   } finally {
     stopProxy();

@@ -334,8 +334,11 @@ test("a resumed turn with only heartbeats stalls with an error instead of hangin
         5_000,
         "the stalled resume hung without an error (the incident)",
       );
-      assert.match(secondText, /\[Error: cursor stream stalled for 1s without output/);
-      assert.match(secondText, /"finish_reason":"stop"/);
+      assert.match(
+        secondText,
+        /"error":\{"code":504,"type":"server_error","message":"cursor stream stalled for 1s without output/,
+      );
+      assert.doesNotMatch(secondText, /"finish_reason"/);
       assert.match(secondText, /data: \[DONE\]/);
     } finally {
       clearInterval(heartbeat);
@@ -370,7 +373,7 @@ test("a fresh turn that only sends heartbeats stalls with an error", { timeout: 
         5_000,
         "a heartbeat-only turn never failed",
       );
-      assert.match(text, /\[Error: cursor stream stalled/);
+      assert.match(text, /"error":\{"code":504,"type":"server_error","message":"cursor stream stalled/);
       assert.match(text, /data: \[DONE\]/);
     } finally {
       clearInterval(heartbeat);
@@ -393,7 +396,7 @@ test("a 200 JSON error body is surfaced instead of being misparsed as a frame", 
   try {
     const response = await withTimeout(chatRequest(port), 5_000, "no response headers");
     const text = await withTimeout(readAll(response), 5_000, "an unframed body hung the client");
-    assert.match(text, /\[Error: cursor upstream sent an unframed response/);
+    assert.match(text, /"error":\{"code":502,"type":"provider_unavailable","message":"cursor upstream sent an unframed response/);
     assert.match(text, /prefill_cap_refused/);
     assert.match(text, /data: \[DONE\]/);
   } finally {
@@ -457,7 +460,10 @@ test("a killed bridge ends the client stream and the proxy keeps serving", { tim
     assert.ok(killed >= 1);
 
     const text = await withTimeout(readAll(response), 5_000, "a dead bridge hung the client");
-    assert.match(text, /\[Error: (cursor bridge exited|bridge connection lost)/);
+    assert.match(
+      text,
+      /"error":\{"code":502,"type":"provider_unavailable","message":"(cursor bridge exited|bridge connection lost)/,
+    );
     assert.match(text, /data: \[DONE\]/);
 
     // Give an async pipe error time to surface, then prove the proxy still
