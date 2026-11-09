@@ -214,7 +214,7 @@ function chatRequest(
   });
 }
 
-async function readAll(response: Response): Promise<string> {
+async function readAll(response: Response, onText?: (text: string) => void): Promise<string> {
   const body = response.body;
   assert.ok(body, "the SSE response has no body");
   const reader = body.getReader();
@@ -223,9 +223,14 @@ async function readAll(response: Response): Promise<string> {
   for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
-    if (value) text += decoder.decode(value, { stream: true });
+    if (value) {
+      text += decoder.decode(value, { stream: true });
+      onText?.(text);
+    }
   }
-  return text + decoder.decode();
+  const rest = text + decoder.decode();
+  onText?.(rest);
+  return rest;
 }
 
 /** Open a streaming POST with a raw socket so the client can hang up mid-body. */
@@ -263,25 +268,28 @@ async function pollUntil(check: () => boolean, ms: number, message: string): Pro
 // --- Tests -----------------------------------------------------------------------
 
 test("headers reach the client while the upstream is still silent", { timeout: 15_000 }, async () => {
+  // The upstream stays silent until the client's headers are back. If the
+  // proxy waited for the first model frame, chatRequest would never resolve.
+  const { promise: headersSeen, resolve: onHeaders } = Promise.withResolvers<void>();
   upstreamSetup((stream) => {
     respondSilent(stream);
-    // No body bytes for well past the header deadline: an old proxy that
-    // waited for the first frame would blow the assertion below.
-    setTimeout(() => {
+    void headersSeen.then(() => {
       if (!stream.closed && !stream.destroyed) stream.end();
-    }, 600);
+    });
   });
 
   const port = await startProxy(async () => "unused", [], 0, TOKEN);
   try {
-    const startedAt = Date.now();
-    const response = await withTimeout(chatRequest(port), 5_000, "no response headers");
-    const elapsed = Date.now() - startedAt;
+    const response = await withTimeout(
+      chatRequest(port),
+      5_000,
+      "no response headers while the upstream was silent",
+    );
 
     assert.equal(response.status, 200);
     assert.match(response.headers.get("content-type") ?? "", /text\/event-stream/);
-    assert.ok(elapsed < 300, `headers took ${elapsed}ms while the upstream was silent`);
 
+    onHeaders();
     await withTimeout(readAll(response), 5_000, "the silent turn never finished");
   } finally {
     stopProxy();
@@ -289,27 +297,33 @@ test("headers reach the client while the upstream is still silent", { timeout: 1
 });
 
 test("keepalive comments flow during silence and never become data frames", { timeout: 15_000 }, async () => {
+  // End the upstream only after the client has actually seen two keepalives;
+  // no fixed silence window and no wall-clock bound.
+  const { promise: keepalivesSeen, resolve: onKeepalives } = Promise.withResolvers<void>();
+  let released = false;
   upstreamSetup((stream) => {
     respondSilent(stream);
-    setTimeout(() => {
+    void keepalivesSeen.then(() => {
+      released = true;
       if (!stream.closed && !stream.destroyed) stream.end();
-    }, 600);
+    });
   });
 
   const port = await startProxy(async () => "unused", [], 0, TOKEN);
   try {
     const response = await withTimeout(chatRequest(port), 5_000, "no response headers");
-    const text = await withTimeout(readAll(response), 10_000, "the stream never finished");
+    const text = await withTimeout(
+      readAll(response, (partial) => {
+        if (!released && (partial.match(/: keepalive\n\n/g) ?? []).length >= 2) onKeepalives();
+      }),
+      10_000,
+      "keepalives never flowed during silence",
+    );
 
     const keepalives = text.match(/: keepalive\n\n/g) ?? [];
-    assert.ok(
-      keepalives.length >= 2,
-      `expected at least 2 keepalives in ~600ms of silence, saw ${keepalives.length}`,
-    );
+    assert.ok(keepalives.length >= 2, `expected at least 2 keepalives, saw ${keepalives.length}`);
     assert.match(text, /data: \[DONE\]/);
 
-    // A comment is not an event: nothing the client parses as `data:` may
-    // mention the keepalive marker.
     const dataEvents = text
       .split("\n\n")
       .map((event) => event.trim())
@@ -410,24 +424,25 @@ test("a non-200 upstream becomes an error, not an empty success", { timeout: 15_
 });
 
 test("non-streaming requests get headers before the model finishes", { timeout: 15_000 }, async () => {
+  // Same causality check as the streaming case: the model stays silent until
+  // the client already has headers.
+  const { promise: headersSeen, resolve: onHeaders } = Promise.withResolvers<void>();
   upstreamSetup((stream) => {
     respondSilent(stream);
-    setTimeout(() => {
+    void headersSeen.then(() => {
       if (!stream.closed && !stream.destroyed) stream.end();
-    }, 600);
+    });
   });
 
   const port = await startProxy(async () => "unused", [], 0, TOKEN);
   try {
-    const startedAt = Date.now();
     const response = await withTimeout(
       chatRequest(port, undefined, { ...streamBody(), stream: false }),
       5_000,
-      "non-streaming request got no headers",
+      "non-streaming request got no headers while the model was silent",
     );
-    const elapsed = Date.now() - startedAt;
-    assert.ok(elapsed < 300, `non-streaming headers took ${elapsed}ms`);
 
+    onHeaders();
     const payload = JSON.parse(await withTimeout(response.text(), 10_000, "no JSON body"));
     assert.equal(payload.object, "chat.completion");
     assert.equal(payload.choices[0].message.content, "");

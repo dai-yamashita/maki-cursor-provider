@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { type ChildProcess, spawn } from "node:child_process";
+import { once } from "node:events";
 import { createServer, type Server } from "node:net";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -65,7 +66,6 @@ test("serve binds with a fixed token before model discovery and restarts on the 
       MAKI_CURSOR_READY: ready,
       CURSOR_API_URL: `http://127.0.0.1:${hang.port}`,
     };
-    const startedAt = Date.now();
     first = spawnServe(baseEnv);
     const deadline = Date.now() + 5000;
     while (Date.now() < deadline) {
@@ -87,16 +87,16 @@ test("serve binds with a fixed token before model discovery and restarts on the 
       headers: { authorization: `Bearer ${token}` },
     });
     assert.equal(ok.status, 200);
-    assert.ok(Date.now() - startedAt < 1000, "health was not ready within one second");
 
     const denied = await fetch(`http://127.0.0.1:${boundPort}/health`, {
       headers: { authorization: "Bearer wrong-bearer" },
     });
     assert.equal(denied.status, 401);
 
+    const firstExited = first ? once(first, "exit") : Promise.resolve();
     killProcessGroup(first);
+    await Promise.race([firstExited, new Promise((resolve) => setTimeout(resolve, 2_000))]);
     first = undefined;
-    await new Promise((resolve) => setTimeout(resolve, 100));
 
     second = spawnServe({
       ...process.env,

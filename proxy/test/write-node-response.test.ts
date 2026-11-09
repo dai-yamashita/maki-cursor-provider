@@ -37,18 +37,16 @@ function closeServer(server: http.Server): Promise<void> {
   });
 }
 
-/** A Response whose body stays silent for `quietMs`, then emits one chunk. */
-function silentThenBody(quietMs: number, body: string): Response {
+function bodyWhenReleased(release: Promise<void>, body: string): Response {
   const stream = new ReadableStream<Uint8Array>({
-    start(controller) {
-      setTimeout(() => {
-        try {
-          controller.enqueue(new TextEncoder().encode(body));
-          controller.close();
-        } catch {
-          // The client already cancelled.
-        }
-      }, quietMs);
+    async start(controller) {
+      await release;
+      try {
+        controller.enqueue(new TextEncoder().encode(body));
+        controller.close();
+      } catch {
+        // The client already cancelled.
+      }
     },
     cancel() {
       // Nothing to release in this fixture.
@@ -60,37 +58,29 @@ function silentThenBody(quietMs: number, body: string): Response {
 }
 
 test("headers reach the client before the first body chunk", async () => {
+  const { promise: released, resolve: onRelease } = Promise.withResolvers<void>();
   const { server, port } = await listen((_req, res) => {
-    void writeNodeResponse(res, silentThenBody(300, "data: [DONE]\n\n"));
+    void writeNodeResponse(res, bodyWhenReleased(released, "data: [DONE]\n\n"));
   });
   try {
-    const startedAt = Date.now();
-    const { headersAt, body } = await new Promise<{
-      headersAt: number;
-      body: string;
-    }>((resolve, reject) => {
-      // Resolve as soon as the status line and headers are readable; a slow
-      // body must not delay this, which is the whole point of flushHeaders().
+    const { body } = await new Promise<{ body: string }>((resolve, reject) => {
       const request = http.get(`http://127.0.0.1:${port}/stream`, (response) => {
-        const headersAt = Date.now();
         assert.equal(response.statusCode, 200);
         assert.equal(response.headers["content-type"], "text/event-stream");
-        // No body byte can have arrived yet: the fixture waits 300ms.
+        // The fixture cannot send a body until onRelease(), so headers that
+        // are readable here prove flushHeaders ran before the first chunk.
         assert.equal(response.read(), null, "body byte arrived with the headers");
         const chunks: Buffer[] = [];
         response.on("data", (chunk: Buffer) => chunks.push(chunk));
         response.once("error", reject);
-        response.once("end", () =>
-          resolve({ headersAt, body: Buffer.concat(chunks).toString("utf8") }),
-        );
+        response.once("end", () => resolve({ body: Buffer.concat(chunks).toString("utf8") }));
+        onRelease();
       });
       request.once("error", reject);
+      // A buffering implementation would deadlock here and hit this timeout.
       request.setTimeout(5_000, () => reject(new Error("response headers never arrived")));
     });
 
-    const elapsed = headersAt - startedAt;
-    assert.ok(elapsed < 200, `headers took ${elapsed}ms; flushHeaders did not run`);
-    // Proves the assertion above measured headers, not the deferred body.
     assert.equal(body, "data: [DONE]\n\n");
   } finally {
     await closeServer(server);
