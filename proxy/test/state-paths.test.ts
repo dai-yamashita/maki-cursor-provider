@@ -92,7 +92,7 @@ test("forget-legacy removes the legacy credential file", () => {
   }
 });
 
-test("refresh prints credentials and writes no legacy file", async () => {
+test("refresh prints credentials and writes no legacy file", { timeout: 15_000 }, async () => {
   const dir = mkdtempSync(join(tmpdir(), "maki-cursor-refresh-"));
   const creds = join(dir, "credentials.json");
   const server = http.createServer((_req, res) => {

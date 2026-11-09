@@ -58,6 +58,18 @@ maki -m cursor/composer-2.5 -r <SESSION_ID>
 - `MAKI_CURSOR_CONVERSATIONS_MAX_FILES`（既定 5000）
 - `MAKI_CURSOR_CONVERSATIONS_MAX_BYTES`（既定 2 GiB）
 
+## 開発（テスト）
+
+プロキシのテストは Node.js 22 以上で実行します。CI と同じコマンドです。
+
+```sh
+cd proxy
+npm ci --omit=dev
+node --experimental-strip-types --disable-warning=ExperimentalWarning --test --test-concurrency=1 test/*.test.ts
+```
+
+`--test-concurrency=1` は、h2 ブリッジのテストが実際のポートと子プロセスを使うためです。
+
 ## 困ったとき
 
 `maki auth status` に `cursor` の行が出ないときは、そのプロセスでこのプラグインが登録されていません。

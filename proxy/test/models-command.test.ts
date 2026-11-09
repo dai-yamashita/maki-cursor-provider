@@ -38,7 +38,7 @@ function listen(): Promise<{ port: number; server: Server; hits: () => number }>
   });
 }
 
-test("models waits until discovery publishes an id", async () => {
+test("models waits until discovery publishes an id", { timeout: 15_000 }, async () => {
   const fixture = await listen();
   try {
     const child = spawn(
