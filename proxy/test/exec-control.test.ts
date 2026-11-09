@@ -385,7 +385,11 @@ test("an exec abort drops the parked exec, logs it, and leaves the bridge open",
         message.message.case === "execClientMessage" ? message.message.value.id : -1,
       );
     assert.deepEqual(answeredIds, [], "the aborted exec must not be answered on resume");
-    assert.match(logText(), /exec control ignored case=none/);
+    await pollUntil(
+      () => /exec control ignored case=none/.test(logText()),
+      2_000,
+      `the ignored control was not logged; log was:\n${logText()}`,
+    );
 
     // The same run continues after the abort, on the same bridge.
     upstreamStream.write(textFrame("after abort"));

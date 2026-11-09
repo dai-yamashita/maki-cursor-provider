@@ -53,7 +53,15 @@ async function withTimeout<T>(promise: Promise<T>, ms: number, message: string):
   }
 }
 
-// --- Shared fake upstream (h2c) -------------------------------------------------
+/** Logging is fire-and-forget, so a written line can lag the SSE response. */
+async function pollUntil(check: () => boolean, timeoutMs: number, message: string): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (check()) return;
+    await delay(20);
+  }
+  assert.ok(check(), message);
+}
 
 /** Per-test upstream behavior; replaced before each request. */
 let onStream: (stream: http2.ServerHttp2Stream) => void = () => {};
@@ -345,8 +353,16 @@ test("a resumed turn with only heartbeats stalls with an error instead of hangin
     }
 
     // The log must explain what the upstream was doing (heartbeats, no text).
-    assert.match(logText(), /stalled: no model progress/);
-    assert.match(logText(), /interactionUpdate:\d+/);
+    await pollUntil(
+      () => /stalled: no model progress/.test(logText()),
+      2_000,
+      `the stall was not logged; log was:\n${logText()}`,
+    );
+    await pollUntil(
+      () => /interactionUpdate:\d+/.test(logText()),
+      2_000,
+      `the server message counts were not logged; log was:\n${logText()}`,
+    );
   } finally {
     stopProxy();
   }

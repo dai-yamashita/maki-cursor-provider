@@ -303,6 +303,9 @@ test(
       assert.match(resumedText, /data: \[DONE\]/);
       assert.doesNotMatch(resumedText, /unframed/);
       assert.doesNotMatch(resumedText, /invalid Connect frame/);
+      // proxyLog is fire-and-forget: give the absent error a chance to land
+      // before asserting that it never happened.
+      await delay(150);
       assert.doesNotMatch(logText(), /cursor protocol error/);
     } finally {
       stopProxy();
