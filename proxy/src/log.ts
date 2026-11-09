@@ -1,25 +1,21 @@
 /**
  * The one place the proxy writes diagnostics.
  *
- * The log lives next to the credentials file maki manages so a bundled
- * install and a source checkout both work. Logging is fire-and-forget: a
- * failure to write must never break a request or keep the process alive.
+ * The log path comes from MAKI_CURSOR_LOG when maki sets it, and otherwise
+ * defaults next to the proxy source. Logging is fire-and-forget: a failure to
+ * write must never break a request or keep the process alive.
  * Callers must never pass tokens, request bodies, or other secrets.
  */
 import { appendFile } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { resolve } from "node:path";
 
 const MAX_LINE_CHARS = 2_000;
 
-function credentialsPath(): string {
-  const configured = process.env.MAKI_CURSOR_CREDENTIALS;
-  if (typeof configured === "string" && configured.length > 0) return configured;
-  return resolve(import.meta.dirname, "..", "credentials.json");
-}
-
 /** Absolute path of the proxy log file. */
 export function proxyLogPath(): string {
-  return resolve(dirname(credentialsPath()), "proxy.log");
+  const configured = process.env.MAKI_CURSOR_LOG;
+  if (typeof configured === "string" && configured.length > 0) return resolve(configured);
+  return resolve(import.meta.dirname, "..", "proxy.log");
 }
 
 /** Collapse to one short line so a stack trace cannot bloat the file. */

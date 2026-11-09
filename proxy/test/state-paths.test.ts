@@ -1,9 +1,13 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { once } from "node:events";
 import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import http from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
+import { proxyLogPath } from "../src/log.ts";
 import { saveConversation } from "../src/proxy.ts";
 
 const node = process.execPath;
@@ -29,7 +33,7 @@ test("a conversation snapshot is written where MAKI_CURSOR_CONVERSATIONS points"
   }
 });
 
-test("logout removes the credential file and conversation directory from the environment", () => {
+test("logout removes the legacy credential file and conversation directory from the environment", () => {
   const dir = mkdtempSync(join(tmpdir(), "maki-cursor-cred-"));
   const creds = join(dir, "nested", "credentials.json");
   const conversations = join(dir, "conversations");
@@ -59,15 +63,21 @@ test("logout removes the credential file and conversation directory from the env
   }
 });
 
-test("status creates the credential directory named by the environment", () => {
-  const dir = mkdtempSync(join(tmpdir(), "maki-cursor-empty-"));
-  const creds = join(dir, "fresh", "credentials.json");
+test("forget-legacy removes the legacy credential file", () => {
+  const dir = mkdtempSync(join(tmpdir(), "maki-cursor-forget-"));
+  const creds = join(dir, "nested", "credentials.json");
+  mkdirSync(dirname(creds), { recursive: true });
+  writeFileSync(creds, JSON.stringify({
+    access: "legacy-access",
+    refresh: "legacy-refresh",
+    expires: 1_700_000_000_000,
+  }));
   try {
     const result = spawnSync(node, [
       "--experimental-strip-types",
       "--disable-warning=ExperimentalWarning",
       cli,
-      "status",
+      "forget-legacy",
     ], {
       env: {
         ...process.env,
@@ -75,10 +85,65 @@ test("status creates the credential directory named by the environment", () => {
       },
       encoding: "utf8",
     });
-    assert.notEqual(result.status, 0);
-    assert.equal(existsSync(dirname(creds)), true);
+    assert.equal(result.status, 0, result.stderr);
     assert.equal(existsSync(creds), false);
   } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("refresh prints credentials and writes no legacy file", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "maki-cursor-refresh-"));
+  const creds = join(dir, "credentials.json");
+  const server = http.createServer((_req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ accessToken: "new-access", refreshToken: "new-refresh" }));
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const { port } = server.address() as AddressInfo;
+  try {
+    const child = spawn(node, [
+      "--experimental-strip-types",
+      "--disable-warning=ExperimentalWarning",
+      cli,
+      "refresh",
+    ], {
+      env: {
+        ...process.env,
+        MAKI_CURSOR_REFRESH: "old-refresh",
+        MAKI_CURSOR_CREDENTIALS: creds,
+        CURSOR_REFRESH_URL: `http://127.0.0.1:${port}/refresh`,
+      },
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8").on("data", (chunk: string) => { stdout += chunk; });
+    child.stderr.setEncoding("utf8").on("data", (chunk: string) => { stderr += chunk; });
+    const [code] = await once(child, "close");
+
+    assert.equal(code, 0, stderr);
+    const parsed = JSON.parse(stdout) as { access: string; refresh: string; expires: number };
+    assert.equal(parsed.access, "new-access");
+    assert.equal(parsed.refresh, "new-refresh");
+    assert.equal(typeof parsed.expires, "number");
+    assert.equal(existsSync(creds), false);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("MAKI_CURSOR_LOG controls the proxy log path", () => {
+  const dir = mkdtempSync(join(tmpdir(), "maki-cursor-log-"));
+  const logPath = join(dir, "custom.log");
+  const previous = process.env.MAKI_CURSOR_LOG;
+  process.env.MAKI_CURSOR_LOG = logPath;
+  try {
+    assert.equal(proxyLogPath(), logPath);
+  } finally {
+    if (previous === undefined) delete process.env.MAKI_CURSOR_LOG;
+    else process.env.MAKI_CURSOR_LOG = previous;
     rmSync(dir, { recursive: true, force: true });
   }
 });

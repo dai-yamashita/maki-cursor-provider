@@ -77,7 +77,7 @@ process.env.CURSOR_EXEC_HEARTBEAT_MS = "50";
 // Long enough that the stall watchdog never masks an end-stream error.
 process.env.CURSOR_STREAM_STALL_TIMEOUT_MS = "30000";
 process.env.MAKI_CURSOR_CONVERSATIONS = conversationDir;
-process.env.MAKI_CURSOR_CREDENTIALS = join(logDir, "credentials.json");
+process.env.MAKI_CURSOR_LOG = join(logDir, "proxy.log");
 delete process.env.CURSOR_PROXY_DEBUG;
 
 const { classifyConnectError, startProxy, stopProxy } = await import("../src/proxy.ts");

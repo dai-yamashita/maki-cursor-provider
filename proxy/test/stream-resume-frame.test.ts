@@ -17,7 +17,7 @@ import http2 from "node:http2";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import test, { after } from "node:test";
 import { create, toBinary } from "@bufbuild/protobuf";
 import {
@@ -73,14 +73,13 @@ const upstreamPort = (upstream.address() as AddressInfo).port;
 
 const conversationDir = mkdtempSync(join(tmpdir(), "maki-cursor-resume-frame-conv-"));
 const logDir = mkdtempSync(join(tmpdir(), "maki-cursor-resume-frame-log-"));
-const credentialsPath = join(logDir, "credentials.json");
-const logPath = join(dirname(credentialsPath), "proxy.log");
+const logPath = join(logDir, "proxy.log");
 
 process.env.CURSOR_API_URL = `http://127.0.0.1:${upstreamPort}`;
 process.env.CURSOR_SSE_KEEPALIVE_MS = "100";
 process.env.CURSOR_EXEC_HEARTBEAT_MS = "50";
 process.env.MAKI_CURSOR_CONVERSATIONS = conversationDir;
-process.env.MAKI_CURSOR_CREDENTIALS = credentialsPath;
+process.env.MAKI_CURSOR_LOG = logPath;
 delete process.env.CURSOR_PROXY_DEBUG;
 
 const { startProxy, stopProxy } = await import("../src/proxy.ts");

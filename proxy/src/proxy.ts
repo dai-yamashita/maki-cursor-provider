@@ -765,6 +765,21 @@ let proxyModels: Array<{ id: string; name: string }> = [];
 let proxyToken = "";
 let bridgeSweepTimer: NodeJS.Timeout | undefined;
 
+/**
+ * Resolve the Cursor access token for one request. maki sends its token as a
+ * per-request header so a long-lived proxy never pins a stale credential; the
+ * startup provider remains the fallback for clients that omit the header.
+ */
+export async function requestAccessToken(
+  headerToken: string | null | undefined,
+  fallback: (() => Promise<string>) | undefined,
+): Promise<string> {
+  const trimmed = headerToken?.trim();
+  if (trimmed) return trimmed;
+  if (!fallback) throw new Error("Cursor proxy access token provider not configured");
+  return fallback();
+}
+
 function buildOpenAIModelList(models: ReadonlyArray<{ id: string; name: string }>): Array<{
   id: string;
   object: "model";
@@ -973,10 +988,10 @@ async function proxyFetch(req: Request): Promise<Response> {
   if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
     try {
       const body = asCompletionRequest(await req.json());
-      if (!proxyAccessTokenProvider) {
-        throw new Error("Cursor proxy access token provider not configured");
-      }
-      const accessToken = await proxyAccessTokenProvider();
+      const accessToken = await requestAccessToken(
+        req.headers.get("x-maki-cursor-access"),
+        proxyAccessTokenProvider,
+      );
       return handleChatCompletion(body, accessToken, req.headers.get("x-maki-session") ?? "");
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);

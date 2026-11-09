@@ -22,32 +22,11 @@ function listenPort(): number {
   return requested;
 }
 
-interface StoredCredentials {
-  access: string;
-  refresh: string;
-  expires: number;
-}
-
-async function readCredentials(): Promise<StoredCredentials | undefined> {
-  try {
-    const parsed = JSON.parse(await readFile(credentialsPath, "utf8")) as StoredCredentials;
-    if (!parsed.access || !parsed.refresh) return undefined;
-    return parsed;
-  } catch {
-    return undefined;
-  }
-}
-
 async function ensureStateDirs(): Promise<void> {
-  await mkdir(dirname(credentialsPath), { recursive: true, mode: 0o700 });
   const conversations = process.env.MAKI_CURSOR_CONVERSATIONS;
   if (conversations) await mkdir(conversations, { recursive: true, mode: 0o700 });
-}
-
-async function writeCredentials(creds: StoredCredentials): Promise<void> {
-  await ensureStateDirs();
-  await writeFile(credentialsPath, JSON.stringify(creds), { mode: 0o600 });
-  await chmod(credentialsPath, 0o600);
+  const log = process.env.MAKI_CURSOR_LOG;
+  if (log) await mkdir(dirname(log), { recursive: true, mode: 0o700 });
 }
 
 function npmCi(): Promise<void> {
@@ -70,6 +49,9 @@ async function ensure(): Promise<void> {
 }
 
 async function serve(): Promise<void> {
+  const access = process.env.MAKI_CURSOR_ACCESS ?? "";
+  // Captured before `ensure()` can spawn npm with this environment.
+  delete process.env.MAKI_CURSOR_ACCESS;
   const failFromServe = (label: string, err: unknown): void => {
     let line = `${label}: `;
     if (err instanceof Error) {
@@ -116,28 +98,13 @@ async function serve(): Promise<void> {
     typeof envToken === "string" && envToken.length > 0
       ? envToken
       : randomBytes(32).toString("base64url");
-  const bound = await startProxy(
-    async () => {
-      const creds = await readCredentials();
-      if (!creds) throw new Error("run maki auth login cursor");
-      if (creds.expires < Date.now()) {
-        const refreshed = await refreshCursorToken(creds.refresh);
-        await writeCredentials(refreshed);
-        return refreshed.access;
-      }
-      return creds.access;
-    },
-    [],
-    listenPort(),
-    token,
-  );
+  const bound = await startProxy(async () => access, [], listenPort(), token);
   const ready = process.env.MAKI_CURSOR_READY;
   if (ready) {
     await writeFile(ready, JSON.stringify({ port: bound, token }), { mode: 0o600 });
     await chmod(ready, 0o600);
   }
-  const current = await readCredentials();
-  const models = await getCursorModels(current?.access ?? "");
+  const models = await getCursorModels(access);
   replaceProxyModels(models.map((model) => ({ id: model.id, name: model.name })));
   await new Promise(() => {});
 }
@@ -163,22 +130,19 @@ async function loginPoll(): Promise<void> {
     refresh: tokens.refreshToken,
     expires: getTokenExpiry(tokens.accessToken),
   };
-  await writeCredentials(creds);
   await rm(statePath, { force: true });
   console.log(JSON.stringify(creds));
 }
 
 async function refresh(): Promise<void> {
-  const creds = await readCredentials();
-  if (!creds) throw new Error("run maki auth login cursor");
-  const refreshed = await refreshCursorToken(creds.refresh);
-  await writeCredentials(refreshed);
+  const refreshToken = process.env.MAKI_CURSOR_REFRESH;
+  if (!refreshToken) throw new Error("run maki auth login cursor");
+  const refreshed = await refreshCursorToken(refreshToken);
   console.log(JSON.stringify(refreshed));
 }
 
-async function status(): Promise<void> {
-  const creds = await readCredentials();
-  if (!creds) process.exit(1);
+async function forgetLegacy(): Promise<void> {
+  await rm(credentialsPath, { force: true });
 }
 
 async function deps(): Promise<void> {
@@ -291,7 +255,7 @@ try {
   else if (command === "login-url") await loginUrl();
   else if (command === "login-poll") await loginPoll();
   else if (command === "refresh") await refresh();
-  else if (command === "status") await status();
+  else if (command === "forget-legacy") await forgetLegacy();
   else if (command === "deps") await deps();
   else if (command === "logout") await logout();
   else if (command === "health") await health();

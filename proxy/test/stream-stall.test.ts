@@ -83,7 +83,7 @@ process.env.CURSOR_SSE_KEEPALIVE_MS = "50";
 process.env.CURSOR_EXEC_HEARTBEAT_MS = "50";
 process.env.CURSOR_STREAM_STALL_TIMEOUT_MS = String(STALL_MS);
 process.env.MAKI_CURSOR_CONVERSATIONS = conversationDir;
-process.env.MAKI_CURSOR_CREDENTIALS = join(logDir, "credentials.json");
+process.env.MAKI_CURSOR_LOG = join(logDir, "proxy.log");
 delete process.env.CURSOR_PROXY_DEBUG;
 
 const { liveBridgeCountForTests, serverMessageIsProgress, startProxy, stopProxy } = await import(

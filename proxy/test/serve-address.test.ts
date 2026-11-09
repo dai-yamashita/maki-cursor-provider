@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { type ChildProcess, spawn } from "node:child_process";
 import { createServer, type Server } from "node:net";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import test from "node:test";
 
 const node = process.execPath;
@@ -49,15 +49,8 @@ function hangServer(): Promise<{ port: number; server: Server }> {
 
 test("serve binds with a fixed token before model discovery and restarts on the same address", async () => {
   const dir = mkdtempSync(join(tmpdir(), "maki-cursor-serve-"));
-  const creds = join(dir, "nested", "credentials.json");
   const ready = join(dir, "ready.json");
   const token = "fixed-bearer-for-serve-address-test";
-  mkdirSync(dirname(creds), { recursive: true });
-  writeFileSync(creds, JSON.stringify({
-    access: "fake-access",
-    refresh: "fake-refresh",
-    expires: Date.now() + 3_600_000,
-  }));
   const hang = await hangServer();
   let first: ChildProcess | undefined;
   let second: ChildProcess | undefined;
@@ -65,7 +58,8 @@ test("serve binds with a fixed token before model discovery and restarts on the 
   try {
     const baseEnv = {
       ...process.env,
-      MAKI_CURSOR_CREDENTIALS: creds,
+      MAKI_CURSOR_ACCESS: "fake-access",
+      MAKI_CURSOR_LOG: join(dir, "proxy.log"),
       MAKI_CURSOR_TOKEN: token,
       MAKI_CURSOR_PORT: "0",
       MAKI_CURSOR_READY: ready,
@@ -106,7 +100,8 @@ test("serve binds with a fixed token before model discovery and restarts on the 
 
     second = spawnServe({
       ...process.env,
-      MAKI_CURSOR_CREDENTIALS: creds,
+      MAKI_CURSOR_ACCESS: "fake-access",
+      MAKI_CURSOR_LOG: join(dir, "proxy.log"),
       MAKI_CURSOR_TOKEN: token,
       MAKI_CURSOR_PORT: String(boundPort),
       CURSOR_API_URL: `http://127.0.0.1:${hang.port}`,

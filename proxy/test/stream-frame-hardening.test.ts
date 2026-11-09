@@ -75,7 +75,7 @@ const logDir = mkdtempSync(join(tmpdir(), "maki-cursor-frames-log-"));
 process.env.CURSOR_API_URL = `http://127.0.0.1:${upstreamPort}`;
 process.env.CURSOR_SSE_KEEPALIVE_MS = String(KEEPALIVE_MS);
 process.env.MAKI_CURSOR_CONVERSATIONS = conversationDir;
-process.env.MAKI_CURSOR_CREDENTIALS = join(logDir, "credentials.json");
+process.env.MAKI_CURSOR_LOG = join(logDir, "proxy.log");
 
 const { startProxy, stopProxy } = await import("../src/proxy.ts");
 

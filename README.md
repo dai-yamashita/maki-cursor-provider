@@ -26,6 +26,27 @@ maki.pack.add({
 maki auth login cursor
 ```
 
-モデルは `cursor/composer-2.5` です。ログインと会話の記録は、パッケージのチェックアウトではなく maki の state ディレクトリにある `maki-cursor-provider/` に置きます。パッケージを更新しても消えません。
+ログインできたかは、次の 2 つで確認します。
+
+```sh
+maki auth status
+maki models | grep '^cursor/'
+```
+
+`maki auth status` は provider を引数に取りません。`maki auth status cursor` は maki 0.7 では使えません。出力に `cursor` の行があれば登録されています。
+
+モデルは `cursor/composer-2.5` です。Cursor のトークンは maki のプラグイン認証ストア（state ディレクトリの `auth/plugins/cursor.json`）だけに置きます。パッケージのチェックアウトにも、プロキシの state ディレクトリにも置きません。古い `credentials.json` は初回に一度だけ取り込み、取り込み後に削除します。会話の記録は state ディレクトリの `maki-cursor-provider/` に置くので、パッケージを更新しても消えません。
 
 プロキシの依存関係は、ログイン時にチェックアウトの `proxy/` へ `npm ci` します。
+
+## 困ったとき
+
+`maki auth status` に `cursor` の行が出ないときは、そのプロセスでこのプラグインが登録されていません。
+
+```sh
+maki auth status 2>&1 | grep -i 'cursor\|warning\|failed to load'
+```
+
+- `--no-plugins` を付けないでください。このオプションは `init.lua` を読まないので、プラグインは登録されません。
+- パッケージがインストールされ、承認されているか確認します。`~/.local/share/maki/site/pack-approvals.json` に `maki-cursor-provider` があり、`providers` に `cursor` が入っている必要があります。
+- トークンの更新に失敗したときは、`maki auth login cursor` をやり直してください。Cursor 側で更新用トークンが無効になっていると、再ログイン以外に復旧できません。

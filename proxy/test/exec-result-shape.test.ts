@@ -15,10 +15,10 @@ import { AgentClientMessageSchema } from "../src/proto/agent_pb.ts";
 import type { AnsweredExec } from "../src/proxy.ts";
 
 // Keep proxyLog out of the checkout: answerPendingExecs logs graph state.
-process.env.MAKI_CURSOR_CREDENTIALS = join(
+process.env.MAKI_CURSOR_LOG = join(
   tmpdir(),
   "maki-cursor-exec-result-shape",
-  "credentials.json",
+  "proxy.log",
 );
 const { answerPendingExecs } = await import("../src/proxy.ts");
 

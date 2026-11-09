@@ -72,7 +72,10 @@ function trackStreamClose(stream: http2.ServerHttp2Stream): Promise<void> {
 // --- Shared fake upstream (h2c) -------------------------------------------------
 
 /** Per-test upstream behavior; replaced before each request. */
-let onStream: (stream: http2.ServerHttp2Stream) => void = () => {};
+let onStream: (
+  stream: http2.ServerHttp2Stream,
+  headers: http2.IncomingHttpHeaders,
+) => void = () => {};
 
 const sessions = new Set<http2.ServerHttp2Session>();
 const upstream = http2.createServer();
@@ -81,12 +84,12 @@ upstream.on("session", (session) => {
   session.on("close", () => sessions.delete(session));
   session.on("error", () => {});
 });
-upstream.on("stream", (stream) => {
+upstream.on("stream", (stream, headers) => {
   // Always consume and drain, so a chatty client can never block on flow
   // control, and an abrupt close is never an unhandled "error".
   stream.on("error", () => {});
   stream.on("data", () => {});
-  onStream(stream);
+  onStream(stream, headers);
 });
 upstream.listen(0, "127.0.0.1");
 await once(upstream, "listening");
@@ -98,7 +101,7 @@ const logDir = mkdtempSync(join(tmpdir(), "maki-cursor-liveness-log-"));
 process.env.CURSOR_API_URL = `http://127.0.0.1:${upstreamPort}`;
 process.env.CURSOR_SSE_KEEPALIVE_MS = String(KEEPALIVE_MS);
 process.env.MAKI_CURSOR_CONVERSATIONS = conversationDir;
-process.env.MAKI_CURSOR_CREDENTIALS = join(logDir, "credentials.json");
+process.env.MAKI_CURSOR_LOG = join(logDir, "proxy.log");
 
 const { liveBridgeCountForTests, startProxy, stopProxy } = await import("../src/proxy.ts");
 
@@ -793,7 +796,40 @@ test("turnEnded closes the SSE even when the upstream stays open", { timeout: 15
   }
 });
 
+test("the per-request token reaches the bridge and is not forwarded", { timeout: 15_000 }, async () => {
+  const { promise: upstreamHeaders, resolve: onSeen } =
+    Promise.withResolvers<http2.IncomingHttpHeaders>();
+  upstreamSetup((stream, headers) => {
+    onSeen(headers);
+    respondSilent(stream);
+  });
+
+  const port = await startProxy(async () => "fallback-token", [], 0, TOKEN);
+  try {
+    const response = await withTimeout(fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${TOKEN}`,
+        "content-type": "application/json",
+        "x-maki-cursor-access": "header-token",
+      },
+      body: JSON.stringify(streamBody()),
+    }), 5_000, "no response headers");
+    assert.equal(response.status, 200);
+    const headers = await withTimeout(upstreamHeaders, 5_000, "the upstream saw no request");
+
+    assert.equal(headers.authorization, "Bearer header-token");
+    assert.equal(headers["x-maki-cursor-access"], undefined);
+    await response.body?.cancel().catch(() => {});
+  } finally {
+    stopProxy();
+  }
+});
+
 /** Install the upstream behavior for the next request. */
-function upstreamSetup(behavior: (stream: http2.ServerHttp2Stream) => void): void {
+function upstreamSetup(behavior: (
+  stream: http2.ServerHttp2Stream,
+  headers: http2.IncomingHttpHeaders,
+) => void): void {
   onStream = behavior;
 }

@@ -19,7 +19,7 @@ import { answerPendingExecs } from "../src/proxy.ts";
 
 // Keep proxyLog out of the checkout: this test exercises answerPendingExecs,
 // which logs the interaction result.
-process.env.MAKI_CURSOR_CREDENTIALS = "/tmp/maki-ask-question-test/credentials.json";
+process.env.MAKI_CURSOR_LOG = "/tmp/maki-ask-question-test/proxy.log";
 
 function questionArgs() {
   return create(AskQuestionArgsSchema, {

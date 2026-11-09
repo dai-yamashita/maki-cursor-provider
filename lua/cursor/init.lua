@@ -2,8 +2,9 @@
 -- Each process starts its own proxy on a free port. The registered URL is only
 -- a placeholder until `auth` returns the real one.
 --
--- `root` is the package checkout. Login files and conversation snapshots live
--- under maki's state directory, because a package update deletes the checkout.
+-- `root` is the package checkout. Cursor tokens live in maki's plugin auth
+-- store, and conversation snapshots under its state directory, because a
+-- package update deletes the checkout.
 
 local M = {}
 
@@ -11,10 +12,13 @@ local PLACEHOLDER_PORT = 9
 local NODE_FLAG = "--experimental-strip-types"
 local PROXY_JOB = "cursor-proxy"
 local STATE_NAME = "maki-cursor-provider"
+-- Stays below maki's 30s auth-hook budget, leaving room to start the proxy.
+local REFRESH_TIMEOUT_MS = 15000
 
 local install_root = nil
 local bound_port = nil
 local bound_token = nil
+local bound_access = nil
 local want_proxy = false
 local proxy_generation = 0
 local RESTART_DELAY_MS = 500
@@ -38,7 +42,7 @@ end
 local function proxy_env(extra)
   local env = {
     MAKI_CURSOR_CONVERSATIONS = state_dir() .. "/conversations",
-    MAKI_CURSOR_CREDENTIALS = state_dir() .. "/credentials.json",
+    MAKI_CURSOR_LOG = state_dir() .. "/proxy.log",
   }
   if bound_port then
     env.MAKI_CURSOR_PORT = tostring(bound_port)
@@ -74,12 +78,12 @@ local function argv(command, extra)
   return cmd
 end
 
-local function run(command, extra, timeout_ms)
+local function run(command, extra, timeout_ms, env_extra)
   -- Provider hooks run outside an agent task. The default job scope is that
   -- task, so a catalogue refresh would fail before node starts.
   local id, err = maki.fn.jobstart(argv(command, extra), {
     cwd = proxy_root(),
-    env = proxy_env(),
+    env = proxy_env(env_extra),
     scope = "plugin",
   })
   if not id then
@@ -94,6 +98,14 @@ end
 -- "error converting Lua integer to table".
 local function trimmed(text)
   return ((text or ""):gsub("%s+$", ""))
+end
+
+local function valid_creds(creds)
+  return type(creds) == "table"
+    and type(creds.access) == "string"
+    and creds.access ~= ""
+    and type(creds.refresh) == "string"
+    and creds.refresh ~= ""
 end
 
 local function failed(result, fallback)
@@ -115,6 +127,68 @@ local function provider_fail(message)
     status = 503,
     body = text,
   })
+end
+
+local legacy_checked = false
+
+-- Tokens live in maki's plugin auth store. An older proxy could refresh
+-- `credentials.json` without updating that store, so the first read adopts it
+-- when its expiry is newer and discards it otherwise. A missing or invalid
+-- expiry counts as 0.
+local function read_legacy()
+  local text = maki.fs.read(state_dir() .. "/credentials.json")
+  if not text then
+    return nil
+  end
+  local parsed = maki.json.decode(text)
+  if not valid_creds(parsed) then
+    return nil
+  end
+  return parsed
+end
+
+local function forget_legacy()
+  local result, err = run("forget-legacy", nil, 5000, {
+    MAKI_CURSOR_CREDENTIALS = state_dir() .. "/credentials.json",
+  })
+  if not result or result.exit_code ~= 0 then
+    maki.log.warn(err or failed(result, "could not remove the legacy cursor credentials"))
+  end
+end
+
+local function load_creds()
+  local stored = maki.provider.auth.get("cursor")
+  if not legacy_checked then
+    legacy_checked = true
+    local legacy = read_legacy()
+    if legacy then
+      local fresher = not valid_creds(stored)
+        or (tonumber(legacy.expires) or 0) > (tonumber(stored.expires) or 0)
+      if fresher then
+        local ok, set_err = maki.provider.auth.set("cursor", {
+          access = legacy.access,
+          refresh = legacy.refresh,
+          expires = legacy.expires,
+        })
+        if ok then
+          forget_legacy()
+        else
+          -- A failed write must not hide a token that still works; the next
+          -- process retries the import.
+          maki.log.warn(set_err or "could not store the cursor login")
+        end
+        return legacy
+      else
+        -- The plugin store already has the newer token, so the old file is
+        -- only a stale copy of the refresh token.
+        forget_legacy()
+      end
+    end
+  end
+  if valid_creds(stored) then
+    return stored
+  end
+  return nil
 end
 
 local function ensure_deps()
@@ -145,15 +219,20 @@ local function stop_proxy()
   end
   bound_port = nil
   bound_token = nil
+  bound_access = nil
 end
 
 local function start_serve_job(extra)
   local job_gen = proxy_generation
+  local env = proxy_env(extra)
+  -- A restarted proxy reads the newest token. Requests also carry it per call,
+  -- so a token change alone never needs a restart.
+  env.MAKI_CURSOR_ACCESS = bound_access or ""
   return maki.fn.jobstart(argv("serve"), {
     cwd = proxy_root(),
     scope = "plugin",
     name = PROXY_JOB,
-    env = proxy_env(extra),
+    env = env,
     on_exit = function()
       maki.defer_fn(function()
         if not want_proxy then
@@ -171,14 +250,18 @@ local function start_serve_job(extra)
   })
 end
 
-local function ensure_running()
+local function ensure_running(access)
   if server_up() then
+    if access then
+      bound_access = access
+    end
     return true
   end
   -- A reload builds a new Lua state but keeps the base URL already handed to
   -- maki. Bind that port again so chat and the catalogue stay on one proxy.
   local keep_port, keep_token = bound_port, bound_token
   stop_proxy()
+  bound_access = access
   local nonce, nonce_err = run("nonce", nil, 5000)
   if not nonce or nonce.exit_code ~= 0 then
     return nil, nonce_err or failed(nonce, "could not start the cursor proxy")
@@ -216,6 +299,9 @@ local function store_login(text)
   if not creds then
     return nil, err or "cursor login returned nothing"
   end
+  if not valid_creds(creds) then
+    return nil, "cursor login did not return an access and refresh token"
+  end
   local ok, set_err = maki.provider.auth.set("cursor", {
     access = creds.access,
     refresh = creds.refresh,
@@ -225,6 +311,32 @@ local function store_login(text)
     return nil, set_err or "could not store the cursor login"
   end
   return true
+end
+
+local function refresh_creds(creds)
+  local refreshed, refresh_err = run("refresh", nil, REFRESH_TIMEOUT_MS, {
+    MAKI_CURSOR_REFRESH = creds.refresh,
+  })
+  if not refreshed or refreshed.exit_code ~= 0 then
+    local message = refresh_err or failed(refreshed, "cursor token refresh failed")
+    return nil, message .. "; run `maki auth login cursor`"
+  end
+  local stored, store_err = store_login(trimmed(refreshed.stdout))
+  if not stored then
+    return nil, store_err or "could not store the cursor login"
+  end
+  return load_creds()
+end
+
+local function ensure_creds(purpose)
+  local creds = load_creds()
+  if not creds then
+    return nil, "run `maki auth login cursor`"
+  end
+  if purpose == "refresh" then
+    return refresh_creds(creds)
+  end
+  return creds
 end
 
 function M.setup(root)
@@ -271,9 +383,9 @@ function M.setup(root)
     end,
 
     auth = function(_, purpose)
-      local logged = run("status", nil, 5000)
-      if not logged or logged.exit_code ~= 0 then
-        return provider_fail("run `maki auth login cursor`")
+      local creds, cred_err = ensure_creds(purpose)
+      if not creds then
+        return provider_fail(cred_err or "run `maki auth login cursor`")
       end
       -- `deps` only checks. A pack update checks out a tree with no
       -- node_modules, so install on the way to the proxy.
@@ -281,23 +393,16 @@ function M.setup(root)
       if not ready then
         return provider_fail(dep_err or "could not install cursor proxy dependencies")
       end
-      if purpose == "refresh" then
-        local refreshed, refresh_err = run("refresh", nil, 30000)
-        if not refreshed or refreshed.exit_code ~= 0 then
-          return provider_fail(refresh_err or failed(refreshed, "cursor token refresh failed"))
-        end
-        local stored, store_err = store_login(trimmed(refreshed.stdout))
-        if not stored then
-          return provider_fail(store_err or "could not store the cursor login")
-        end
-      end
-      local running, run_err = ensure_running()
+      local running, run_err = ensure_running(creds.access)
       if not running then
         return provider_fail(run_err or "could not start the cursor proxy")
       end
       return {
         base_url = base_url(),
-        headers = { Authorization = "Bearer " .. bound_token },
+        headers = {
+          Authorization = "Bearer " .. bound_token,
+          ["x-maki-cursor-access"] = creds.access,
+        },
       }
     end,
 
@@ -319,11 +424,15 @@ function M.setup(root)
           bound_token = token
         end
       end
+      local creds, cred_err = ensure_creds("resolve")
+      if not creds then
+        return provider_fail(cred_err or "run `maki auth login cursor`")
+      end
       local ready, dep_err = ensure_deps()
       if not ready then
         return provider_fail(dep_err or "could not install cursor proxy dependencies")
       end
-      local running, run_err = ensure_running()
+      local running, run_err = ensure_running(creds.access)
       if not running then
         return provider_fail(run_err or "could not start the cursor proxy")
       end
@@ -377,7 +486,9 @@ function M.setup(root)
 
     logout = function()
       stop_proxy()
-      run("logout", nil, 5000)
+      run("logout", nil, 5000, {
+        MAKI_CURSOR_CREDENTIALS = state_dir() .. "/credentials.json",
+      })
     end,
   })
   return true
