@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import http2 from "node:http2";
+import net from "node:net";
 import type { AddressInfo } from "node:net";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -169,11 +170,76 @@ test("an RST_STREAM is reported even though the stream ends without an error", {
   });
 
   try {
-    const result = await runBridge(port);
+    // Keep stdin open: a Node http2 server drops close(CANCEL) once the peer
+    // has already half-closed, so this must not race the request END_STREAM.
+    const result = await runBridge(port, 5_000, false);
     assertFailedExit(result);
     assert.match(result.stderr, /\[h2-bridge\] upstream reset code 8/);
   } finally {
     await stopUpstream(server);
+  }
+});
+
+function rstStreamFrame(streamId: number, code: number): Buffer {
+  const f = Buffer.alloc(13);
+  f.writeUIntBE(4, 0, 3);
+  f[3] = 0x03;
+  f[4] = 0;
+  f.writeUInt32BE(streamId, 5);
+  f.writeUInt32BE(code, 9);
+  return f;
+}
+
+function hasHeadersFrame(buf: Buffer): boolean {
+  let off = 0;
+  while (off + 9 <= buf.length) {
+    const len = buf.readUIntBE(off, 3);
+    if (off + 9 + len > buf.length) return false;
+    if (buf[off + 3] === 0x01) return true;
+    off += 9 + len;
+  }
+  return false;
+}
+
+test("a reset after the request half-closes is still a failure", { timeout: 15_000 }, async () => {
+  // A Node http2 server drops close(CANCEL) once the peer has half-closed, so
+  // the RST_STREAM is injected on the wire to reproduce what a real upstream
+  // sends. This is the ordering CI hits: the bridge ends its stdin first.
+  const { server: upstream, port: upstreamPort } = await startUpstream((stream) => {
+    stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+  });
+
+  const front = net.createServer((client) => {
+    const upstreamConn = net.connect(upstreamPort, "127.0.0.1");
+    client.on("error", () => {});
+    upstreamConn.on("error", () => {});
+    client.on("data", (d) => upstreamConn.write(d));
+    let seen = Buffer.alloc(0);
+    let injected = false;
+    upstreamConn.on("data", (d) => {
+      client.write(d);
+      seen = Buffer.concat([seen, d]);
+      if (!injected && hasHeadersFrame(seen)) {
+        injected = true;
+        setTimeout(() => {
+          if (!client.destroyed) client.write(rstStreamFrame(1, http2.constants.NGHTTP2_CANCEL));
+        }, 10);
+      }
+    });
+    client.on("end", () => upstreamConn.end());
+    upstreamConn.on("end", () => client.end());
+  });
+  front.listen(0, "127.0.0.1");
+  await once(front, "listening");
+  const port = (front.address() as AddressInfo).port;
+
+  try {
+    const result = await runBridge(port);
+    assertFailedExit(result);
+    assert.match(result.stderr, /\[h2-bridge\] upstream reset code 8/);
+  } finally {
+    await new Promise<void>((resolve) => front.close(() => resolve()));
+    await stopUpstream(upstream);
   }
 });
 
